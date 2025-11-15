@@ -6,7 +6,12 @@ export const metadata: Metadata = {
   description: 'Create beautiful events with seamless video meetings. No downloads, no API keys, just pure WebRTC.',
   keywords: 'video meeting, webrtc, online meeting, video conference',
   authors: [{ name: 'Luma Meet' }],
-  viewport: 'width=device-width, initial-scale=1, maximum-scale=1',
+};
+
+export const viewport = {
+  width: 'device-width',
+  initialScale: 1,
+  maximumScale: 1,
 };
 
 export default function RootLayout({
