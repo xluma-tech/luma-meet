@@ -1,0 +1,3 @@
+@echo off
+echo Starting Luma Meet...
+npm run dev
