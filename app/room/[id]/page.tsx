@@ -30,7 +30,8 @@ export default function RoomPage() {
 
   useEffect(() => {
     // Initialize socket connection
-    socketRef.current = io('http://localhost:3000');
+    const socketUrl = process.env.NEXT_PUBLIC_SOCKET_URL || window.location.origin;
+    socketRef.current = io(socketUrl);
 
     // Get user media
     navigator.mediaDevices
