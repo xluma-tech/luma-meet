@@ -86,6 +86,17 @@ app.prepare().then(() => {
       }
     });
 
+    socket.on('screen-signal', ({ to, signal }) => {
+      try {
+        io.to(to).emit('screen-signal', {
+          from: socket.id,
+          signal: signal,
+        });
+      } catch (err) {
+        console.error('Error sending screen signal:', err);
+      }
+    });
+
     socket.on('chat-message', ({ roomId, userName, message, timestamp }) => {
       try {
         socket.to(roomId).emit('chat-message', {
