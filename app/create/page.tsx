@@ -164,7 +164,7 @@ export default function CreateEvent() {
               <div>
                 <h3 className="font-semibold text-purple-300 mb-2">What happens next?</h3>
                 <ul className="text-sm text-gray-300 space-y-1">
-                  <li>• You'll get a unique meeting code</li>
+                  <li>• You&apos;ll get a unique meeting code</li>
                   <li>• Share the code with your participants</li>
                   <li>• Everyone can join instantly - no sign-up required</li>
                 </ul>

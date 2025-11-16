@@ -24,7 +24,13 @@ async function getEvents() {
   return JSON.parse(data);
 }
 
-async function saveEvents(events: any[]) {
+interface Event {
+  id: string;
+  createdAt: string;
+  [key: string]: unknown;
+}
+
+async function saveEvents(events: Event[]) {
   await ensureDataFile();
   await fs.writeFile(DATA_FILE, JSON.stringify(events, null, 2));
 }
@@ -34,7 +40,7 @@ export async function POST(request: Request) {
     const body = await request.json();
     const events = await getEvents();
     
-    const newEvent = {
+    const newEvent: Event = {
       id: nanoid(10),
       ...body,
       createdAt: new Date().toISOString(),
@@ -44,7 +50,7 @@ export async function POST(request: Request) {
     await saveEvents(events);
 
     return NextResponse.json(newEvent);
-  } catch (error) {
+  } catch {
     return NextResponse.json({ error: 'Failed to create event' }, { status: 500 });
   }
 }

@@ -13,21 +13,26 @@ async function getEvents() {
   }
 }
 
+interface Event {
+  id: string;
+  [key: string]: unknown;
+}
+
 export async function GET(
-  request: Request,
+  _request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
     const { id } = await params;
     const events = await getEvents();
-    const event = events.find((e: any) => e.id === id);
+    const event = events.find((e: Event) => e.id === id);
 
     if (!event) {
       return NextResponse.json({ error: 'Event not found' }, { status: 404 });
     }
 
     return NextResponse.json(event);
-  } catch (error) {
+  } catch {
     return NextResponse.json({ error: 'Failed to fetch event' }, { status: 500 });
   }
 }

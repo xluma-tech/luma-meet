@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-require-imports */
 const { createServer } = require('http');
 const { parse } = require('url');
 const next = require('next');
@@ -110,7 +111,7 @@ app.prepare().then(() => {
       }
     });
 
-    socket.on('private-message', ({ roomId, userName, message, timestamp, to }) => {
+    socket.on('private-message', ({ userName, message, timestamp, to }) => {
       try {
         io.to(to).emit('private-message', {
           userId: socket.id,

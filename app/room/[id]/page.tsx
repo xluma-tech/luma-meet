@@ -5,6 +5,14 @@ import { useParams, useSearchParams } from 'next/navigation';
 import { io, Socket } from 'socket.io-client';
 import SimplePeer from 'simple-peer';
 
+// Development logging utility
+const isDev = process.env.NODE_ENV === 'development';
+const devLog = (...args: unknown[]) => {
+  if (isDev) {
+    console.log(...args);
+  }
+};
+
 interface Peer {
   peer: SimplePeer.Instance;
   userId: string;
@@ -45,10 +53,13 @@ const getDeviceInfo = () => {
   const isFirefox = /firefox/i.test(ua);
   const isSafari = /safari/i.test(ua) && !/chrome/i.test(ua) && !/android/i.test(ua);
   
-  // Screen share support - desktop only
+  // Screen share support - now available on all devices with getDisplayMedia
   const isDesktopDevice = !isMobile && !isTablet;
   const hasGetDisplayMedia = typeof navigator.mediaDevices?.getDisplayMedia === 'function';
-  const supportsScreenShare = isDesktopDevice && hasGetDisplayMedia;
+  
+  // Enable screen share for all devices that support getDisplayMedia API
+  // iOS 15.4+ Safari supports screen sharing
+  const supportsScreenShare = hasGetDisplayMedia;
 
   return {
     isMobile: isMobile && !isTablet,
@@ -85,18 +96,184 @@ export default function RoomPage() {
 
   const socketRef = useRef<Socket | null>(null);
   const localVideoRef = useRef<HTMLVideoElement>(null);
-  const screenVideoRef = useRef<HTMLVideoElement>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const peersRef = useRef<Peer[]>([]);
   const screenPeersRef = useRef<ScreenPeer[]>([]); // Separate ref for screen peers
   const screenStreamRef = useRef<MediaStream | null>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
 
+  // Peer creation functions - declared before useEffect to avoid hoisting issues
+  const createPeer = (userToSignal: string, stream: MediaStream) => {
+    const peer = new SimplePeer({
+      initiator: true,
+      trickle: true,
+      stream,
+      config: {
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:stun1.l.google.com:19302' },
+          { urls: 'stun:stun2.l.google.com:19302' },
+          { urls: 'stun:stun3.l.google.com:19302' },
+          { urls: 'stun:stun4.l.google.com:19302' },
+        ],
+      },
+    });
+
+    peer.on('signal', (signal) => {
+      socketRef.current?.emit('signal', { to: userToSignal, signal });
+    });
+
+    peer.on('stream', (remoteStream) => {
+      devLog(`Received camera stream from ${userToSignal}:`, remoteStream.id);
+      const peerIndex = peersRef.current.findIndex((p) => p.userId === userToSignal);
+      if (peerIndex !== -1) {
+        peersRef.current[peerIndex].stream = remoteStream;
+        setPeers([...peersRef.current]);
+        devLog(`Camera stream set for peer ${userToSignal}`);
+      }
+    });
+
+    peer.on('error', (err: Error) => {
+      if (err.message?.includes('User-Initiated Abort') || err.message?.includes('Close called')) {
+        return;
+      }
+      console.error('Peer error:', err);
+    });
+
+    peer.on('close', () => {
+      // Peer connection closed
+    });
+
+    return peer;
+  };
+
+  const addPeer = (incomingSignal: string, stream: MediaStream) => {
+    const peer = new SimplePeer({
+      initiator: false,
+      trickle: true,
+      stream,
+      config: {
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:stun1.l.google.com:19302' },
+          { urls: 'stun:stun2.l.google.com:19302' },
+          { urls: 'stun:stun3.l.google.com:19302' },
+          { urls: 'stun:stun4.l.google.com:19302' },
+        ],
+      },
+    });
+
+    peer.on('signal', (signal) => {
+      socketRef.current?.emit('signal', { to: incomingSignal, signal });
+    });
+
+    peer.on('stream', (remoteStream) => {
+      console.log(`Received camera stream from ${incomingSignal}:`, remoteStream.id);
+      const peerIndex = peersRef.current.findIndex((p) => p.userId === incomingSignal);
+      if (peerIndex !== -1) {
+        peersRef.current[peerIndex].stream = remoteStream;
+        setPeers([...peersRef.current]);
+        console.log(`Camera stream set for peer ${incomingSignal}`);
+      }
+    });
+
+    peer.on('error', (err: Error) => {
+      if (err.message?.includes('User-Initiated Abort') || err.message?.includes('Close called')) {
+        return;
+      }
+      console.error('Peer error:', err);
+    });
+
+    peer.on('close', () => {
+      // Peer connection closed
+    });
+
+    return peer;
+  };
+
+  const createScreenPeer = (userToSignal: string, stream: MediaStream) => {
+    const peer = new SimplePeer({
+      initiator: true,
+      trickle: true,
+      stream,
+      config: {
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:stun1.l.google.com:19302' },
+          { urls: 'stun:stun2.l.google.com:19302' },
+          { urls: 'stun:stun3.l.google.com:19302' },
+          { urls: 'stun:stun4.l.google.com:19302' },
+        ],
+      },
+    });
+
+    peer.on('signal', (signal) => {
+      socketRef.current?.emit('screen-signal', { to: userToSignal, signal });
+    });
+
+    peer.on('stream', (remoteStream) => {
+      const peerIndex = screenPeersRef.current.findIndex((p) => p.userId === userToSignal);
+      if (peerIndex !== -1) {
+        screenPeersRef.current[peerIndex].stream = remoteStream;
+        setScreenPeers([...screenPeersRef.current]);
+      }
+    });
+
+    peer.on('error', (err: Error) => {
+      if (err.message?.includes('User-Initiated Abort') || err.message?.includes('Close called')) {
+        return;
+      }
+      console.error('Screen peer error:', err);
+    });
+
+    return peer;
+  };
+
+  const addScreenPeer = (incomingSignal: string, stream: MediaStream) => {
+    const peer = new SimplePeer({
+      initiator: false,
+      trickle: true,
+      stream,
+      config: {
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:stun1.l.google.com:19302' },
+          { urls: 'stun:stun2.l.google.com:19302' },
+          { urls: 'stun:stun3.l.google.com:19302' },
+          { urls: 'stun:stun4.l.google.com:19302' },
+        ],
+      },
+    });
+
+    peer.on('signal', (signal) => {
+      socketRef.current?.emit('screen-signal', { to: incomingSignal, signal });
+    });
+
+    peer.on('stream', (remoteStream) => {
+      console.log(`Screen peer received stream from ${incomingSignal}:`, remoteStream.id);
+      const peerIndex = screenPeersRef.current.findIndex((p) => p.userId === incomingSignal);
+      if (peerIndex !== -1) {
+        screenPeersRef.current[peerIndex].stream = remoteStream;
+        setScreenPeers([...screenPeersRef.current]);
+        console.log(`Screen peer stream set for ${incomingSignal}`);
+      }
+    });
+
+    peer.on('error', (err: Error) => {
+      if (err.message?.includes('User-Initiated Abort') || err.message?.includes('Close called')) {
+        return;
+      }
+      console.error('Screen peer error:', err);
+    });
+
+    return peer;
+  };
+
   useEffect(() => {
     // Detect device and browser info
     const info = getDeviceInfo();
     setDeviceInfo(info);
-    console.log('Device Info:', info);
+    devLog('Device Info:', info);
 
     const socketUrl = process.env.NEXT_PUBLIC_SOCKET_URL || window.location.origin;
     socketRef.current = io(socketUrl, {
@@ -144,7 +321,7 @@ export default function RoomPage() {
 
         socketRef.current?.emit('join-room', { roomId, userName });
 
-        socketRef.current?.on('existing-users', (users: any[]) => {
+        socketRef.current?.on('existing-users', (users: Array<{ userId: string; userName: string }>) => {
           const newPeers: Peer[] = [];
           users.forEach((user) => {
             const peer = createPeer(user.userId, stream);
@@ -174,15 +351,17 @@ export default function RoomPage() {
           if (item && item.peer) {
             try {
               // Check if peer is not destroyed before signaling
-              if (!(item.peer as any).destroyed && !(item.peer as any)._destroying) {
+              const peerInternal = item.peer as SimplePeer.Instance & { destroyed?: boolean; _destroying?: boolean };
+              if (!peerInternal.destroyed && !peerInternal._destroying) {
                 item.peer.signal(signal);
               } else {
                 console.log(`Ignoring signal for destroyed peer ${from}`);
               }
-            } catch (err: any) {
+            } catch (err) {
+              const error = err as Error;
               // Silently ignore errors for destroyed peers
-              if (!err.message?.includes('cannot signal after peer is destroyed')) {
-                console.error('Error signaling peer:', err);
+              if (!error.message?.includes('cannot signal after peer is destroyed')) {
+                console.error('Error signaling peer:', error);
               }
             }
           }
@@ -232,12 +411,14 @@ export default function RoomPage() {
           const item = screenPeersRef.current.find((p) => p.userId === from);
           if (item && item.peer) {
             try {
-              if (!(item.peer as any).destroyed && !(item.peer as any)._destroying) {
+              const peerInternal = item.peer as SimplePeer.Instance & { destroyed?: boolean; _destroying?: boolean };
+              if (!peerInternal.destroyed && !peerInternal._destroying) {
                 item.peer.signal(signal);
               }
-            } catch (err: any) {
-              if (!err.message?.includes('cannot signal after peer is destroyed')) {
-                console.error('Error signaling screen peer:', err);
+            } catch (err) {
+              const error = err as Error;
+              if (!error.message?.includes('cannot signal after peer is destroyed')) {
+                console.error('Error signaling screen peer:', error);
               }
             }
           }
@@ -291,174 +472,12 @@ export default function RoomPage() {
       screenPeersRef.current.forEach((p) => p.peer.destroy());
       socketRef.current?.disconnect();
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomId, userName]);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
-
-  function createPeer(userToSignal: string, stream: MediaStream) {
-    const peer = new SimplePeer({
-      initiator: true,
-      trickle: true,
-      stream,
-      config: {
-        iceServers: [
-          { urls: 'stun:stun.l.google.com:19302' },
-          { urls: 'stun:stun1.l.google.com:19302' },
-          { urls: 'stun:stun2.l.google.com:19302' },
-          { urls: 'stun:stun3.l.google.com:19302' },
-          { urls: 'stun:stun4.l.google.com:19302' },
-        ],
-      },
-    });
-
-    peer.on('signal', (signal) => {
-      socketRef.current?.emit('signal', { to: userToSignal, signal });
-    });
-
-    peer.on('stream', (remoteStream) => {
-      const peerIndex = peersRef.current.findIndex((p) => p.userId === userToSignal);
-      if (peerIndex !== -1) {
-        peersRef.current[peerIndex].stream = remoteStream;
-        setPeers([...peersRef.current]);
-      }
-    });
-
-    peer.on('error', (err: any) => {
-      if (err.message?.includes('User-Initiated Abort') || err.message?.includes('Close called')) {
-        return;
-      }
-      console.error('Peer error:', err);
-    });
-
-    peer.on('close', () => {
-      // Peer connection closed
-    });
-
-    return peer;
-  }
-
-  function createScreenPeer(userToSignal: string, stream: MediaStream) {
-    const peer = new SimplePeer({
-      initiator: true,
-      trickle: true,
-      stream,
-      config: {
-        iceServers: [
-          { urls: 'stun:stun.l.google.com:19302' },
-          { urls: 'stun:stun1.l.google.com:19302' },
-          { urls: 'stun:stun2.l.google.com:19302' },
-          { urls: 'stun:stun3.l.google.com:19302' },
-          { urls: 'stun:stun4.l.google.com:19302' },
-        ],
-      },
-    });
-
-    peer.on('signal', (signal) => {
-      socketRef.current?.emit('screen-signal', { to: userToSignal, signal });
-    });
-
-    peer.on('stream', (remoteStream) => {
-      const peerIndex = screenPeersRef.current.findIndex((p) => p.userId === userToSignal);
-      if (peerIndex !== -1) {
-        screenPeersRef.current[peerIndex].stream = remoteStream;
-        setScreenPeers([...screenPeersRef.current]);
-      }
-    });
-
-    peer.on('error', (err: any) => {
-      if (err.message?.includes('User-Initiated Abort') || err.message?.includes('Close called')) {
-        return;
-      }
-      console.error('Screen peer error:', err);
-    });
-
-    return peer;
-  }
-
-  function addScreenPeer(incomingSignal: string, stream: MediaStream) {
-    const peer = new SimplePeer({
-      initiator: false,
-      trickle: true,
-      stream,
-      config: {
-        iceServers: [
-          { urls: 'stun:stun.l.google.com:19302' },
-          { urls: 'stun:stun1.l.google.com:19302' },
-          { urls: 'stun:stun2.l.google.com:19302' },
-          { urls: 'stun:stun3.l.google.com:19302' },
-          { urls: 'stun:stun4.l.google.com:19302' },
-        ],
-      },
-    });
-
-    peer.on('signal', (signal) => {
-      socketRef.current?.emit('screen-signal', { to: incomingSignal, signal });
-    });
-
-    peer.on('stream', (remoteStream) => {
-      console.log(`Screen peer received stream from ${incomingSignal}:`, remoteStream.id);
-      const peerIndex = screenPeersRef.current.findIndex((p) => p.userId === incomingSignal);
-      if (peerIndex !== -1) {
-        screenPeersRef.current[peerIndex].stream = remoteStream;
-        setScreenPeers([...screenPeersRef.current]);
-        console.log(`Screen peer stream set for ${incomingSignal}`);
-      }
-    });
-
-    peer.on('error', (err: any) => {
-      if (err.message?.includes('User-Initiated Abort') || err.message?.includes('Close called')) {
-        return;
-      }
-      console.error('Screen peer error:', err);
-    });
-
-    return peer;
-  }
-
-  function addPeer(incomingSignal: string, stream: MediaStream) {
-    const peer = new SimplePeer({
-      initiator: false,
-      trickle: true, // Enable trickle ICE for better connectivity
-      stream,
-      config: {
-        iceServers: [
-          { urls: 'stun:stun.l.google.com:19302' },
-          { urls: 'stun:stun1.l.google.com:19302' },
-          { urls: 'stun:stun2.l.google.com:19302' },
-          { urls: 'stun:stun3.l.google.com:19302' },
-          { urls: 'stun:stun4.l.google.com:19302' },
-        ],
-      },
-    });
-
-    peer.on('signal', (signal) => {
-      socketRef.current?.emit('signal', { to: incomingSignal, signal });
-    });
-
-    peer.on('stream', (remoteStream) => {
-      const peerIndex = peersRef.current.findIndex((p) => p.userId === incomingSignal);
-      if (peerIndex !== -1) {
-        peersRef.current[peerIndex].stream = remoteStream;
-        setPeers([...peersRef.current]);
-      }
-    });
-
-    peer.on('error', (err: any) => {
-      // Ignore expected errors from user-initiated disconnections
-      if (err.message?.includes('User-Initiated Abort') || err.message?.includes('Close called')) {
-        return;
-      }
-      console.error('Peer error:', err);
-    });
-
-    peer.on('close', () => {
-      // Peer connection closed, cleanup handled in user-left event
-    });
-
-    return peer;
-  }
 
   const toggleAudio = () => {
     if (localStreamRef.current) {
@@ -485,38 +504,62 @@ export default function RoomPage() {
       try {
         // Check device support
         if (!deviceInfo?.supportsScreenShare) {
-          let message = 'Screen sharing is not supported on this device.';
-          if (deviceInfo?.isIOS) {
-            message = 'Screen sharing is not available on iOS. Please use Safari on macOS or Chrome on Windows/Mac.';
-          } else if (deviceInfo?.isAndroid) {
-            message = 'Screen sharing is not available on mobile. Please use a desktop browser.';
-          } else if (!deviceInfo?.isDesktop) {
-            message = 'Screen sharing is only available on desktop browsers.';
-          }
-          alert(message);
+          alert('Screen sharing is not supported on this browser. Please update to the latest version or try a different browser.');
           return;
         }
 
-        // Universal screen share constraints that work across all desktop browsers
-        const constraints: any = {
-          video: {
-            cursor: 'always',
-          },
+        // Universal screen share constraints that work across all devices
+        interface ScreenShareConstraints {
+          video: boolean | (MediaTrackConstraints & {
+            cursor?: string;
+            mediaSource?: string;
+            displaySurface?: string;
+            width?: { ideal: number };
+            height?: { ideal: number };
+            frameRate?: { ideal: number };
+          });
+          audio: boolean;
+        }
+
+        const constraints: ScreenShareConstraints = {
+          video: true,
           audio: false,
         };
 
-        // Add browser-specific optimizations
-        if (deviceInfo?.isChrome || deviceInfo?.isEdge) {
-          constraints.video.width = { ideal: 1920 };
-          constraints.video.height = { ideal: 1080 };
-          constraints.video.frameRate = { ideal: 30 };
-        } else if (deviceInfo?.isFirefox) {
-          constraints.video.mediaSource = 'screen';
-          constraints.video.width = { ideal: 1920 };
-          constraints.video.height = { ideal: 1080 };
-        } else if (deviceInfo?.isSafari) {
-          // Safari has more limited support
+        // Add device and browser-specific optimizations
+        if (deviceInfo?.isIOS) {
+          // iOS Safari - keep it simple, let the system handle it
           constraints.video = true;
+        } else if (deviceInfo?.isMobile || deviceInfo?.isTablet) {
+          // Android mobile/tablet optimizations
+          if (typeof constraints.video !== 'boolean') {
+            constraints.video = {
+              width: { ideal: 1280 },
+              height: { ideal: 720 },
+              frameRate: { ideal: 24 },
+            };
+          }
+        } else if (deviceInfo?.isChrome || deviceInfo?.isEdge) {
+          // Desktop Chrome/Edge
+          constraints.video = {
+            cursor: 'always',
+            width: { ideal: 1920 },
+            height: { ideal: 1080 },
+            frameRate: { ideal: 30 },
+          };
+        } else if (deviceInfo?.isFirefox) {
+          // Desktop Firefox
+          constraints.video = {
+            mediaSource: 'screen',
+            width: { ideal: 1920 },
+            height: { ideal: 1080 },
+          };
+        } else if (deviceInfo?.isSafari && deviceInfo?.isDesktop) {
+          // Desktop Safari
+          constraints.video = {
+            width: { ideal: 1920 },
+            height: { ideal: 1080 },
+          };
         }
 
         console.log('Starting screen share with constraints:', constraints);
@@ -527,20 +570,9 @@ export default function RoomPage() {
 
         console.log('Screen track obtained:', screenTrack.label, screenTrack.getSettings());
 
-        // Set state first to update UI
+        // Update state to trigger UI change
         setIsScreenSharing(true);
         setScreenSharingUserId('local');
-
-        // Set screen video locally
-        setTimeout(() => {
-          if (screenVideoRef.current) {
-            screenVideoRef.current.srcObject = screenStream;
-            screenVideoRef.current.play().catch((err) => {
-              console.error('Error playing screen video:', err);
-            });
-            console.log('Screen video ref set and playing');
-          }
-        }, 100);
 
         // Create screen share stream with audio
         const audioTrack = localStreamRef.current?.getAudioTracks()[0];
@@ -564,21 +596,19 @@ export default function RoomPage() {
         });
         setScreenPeers([...screenPeersRef.current]);
 
-        // Notify server we're starting screen share
-        socketRef.current?.emit('screen-share-started', { roomId });
-        console.log('Screen sharing started with separate peers');
-
         // Handle when user stops sharing via browser UI
         screenTrack.onended = () => {
           console.log('Screen share ended by user');
           stopScreenShare();
         };
 
+        // Notify server we're starting screen share
         socketRef.current?.emit('screen-share-started', { roomId });
         console.log('Screen sharing started successfully');
-      } catch (err: any) {
-        console.error('Error sharing screen:', err);
-        if (err.name === 'NotAllowedError') {
+      } catch (err) {
+        const error = err as Error & { name?: string };
+        console.error('Error sharing screen:', error);
+        if (error.name === 'NotAllowedError') {
           // User cancelled screen share
           return;
         }
@@ -599,11 +629,6 @@ export default function RoomPage() {
         console.log('Stopped screen track:', track.label);
       });
       screenStreamRef.current = null;
-    }
-
-    // Clear screen video element
-    if (screenVideoRef.current) {
-      screenVideoRef.current.srcObject = null;
     }
 
     // Destroy ONLY the screen share peers (camera peers stay active!)
@@ -747,20 +772,10 @@ export default function RoomPage() {
               <div className="flex-1 bg-black p-4 overflow-hidden">
                 <div className="h-full bg-gray-900 rounded-lg overflow-hidden relative">
                   {screenSharingUserId === 'local' ? (
-                    <>
-                      <video
-                        key="screen-share-video"
-                        ref={screenVideoRef}
-                        autoPlay
-                        muted
-                        playsInline
-                        className="w-full h-full object-contain bg-black"
-                        style={{ maxHeight: '100%', maxWidth: '100%' }}
-                      />
-                      <div className="absolute bottom-4 left-4 bg-black bg-opacity-70 px-4 py-2 rounded-lg z-10">
-                        <span className="text-sm font-semibold">{userName} (You) - Sharing Screen</span>
-                      </div>
-                    </>
+                    <LocalScreenShare 
+                      stream={screenStreamRef.current} 
+                      userName={userName}
+                    />
                   ) : (
                     (() => {
                       const sharingPeer = screenPeers.find((p) => p.userId === screenSharingUserId);
@@ -782,34 +797,24 @@ export default function RoomPage() {
 
               <div className="h-32 bg-gray-900 px-4 pb-4 flex gap-2 overflow-x-auto flex-shrink-0">
                 {/* Always show local camera in strip when screen sharing is active */}
-                {screenSharingUserId !== 'local' && (
-                  <div className="w-40 h-full relative bg-gray-800 rounded-lg overflow-hidden flex-shrink-0">
-                    <video 
-                      key="local-camera-small"
-                      ref={localVideoRef} 
-                      autoPlay 
-                      muted 
-                      playsInline 
-                      className="w-full h-full object-cover" 
-                    />
-                    <div className="absolute bottom-2 left-2 bg-black bg-opacity-70 px-2 py-1 rounded text-xs z-10">
-                      {userName} (You)
-                    </div>
-                    {!isVideoEnabled && (
-                      <div className="absolute inset-0 flex items-center justify-center bg-gray-700">
-                        <span className="text-3xl">👤</span>
-                      </div>
-                    )}
-                  </div>
-                )}
+                <LocalVideoStrip 
+                  stream={localStreamRef.current} 
+                  userName={userName} 
+                  isVideoEnabled={isVideoEnabled}
+                />
 
-                {/* Show all other participants' cameras (except the one sharing screen) */}
+                {/* Show all other participants' cameras */}
                 {peers.map((peer) => (
                   <div
-                    key={peer.userId}
+                    key={`strip-${peer.userId}`}
                     className="w-40 h-full relative bg-gray-800 rounded-lg overflow-hidden flex-shrink-0"
                   >
-                    <VideoCard peer={peer.peer} userName={peer.userName} isMainView={false} />
+                    <VideoCardStrip 
+                      key={`video-${peer.userId}-${peer.stream?.id || 'no-stream'}`}
+                      peer={peer.peer} 
+                      userName={peer.userName} 
+                      stream={peer.stream} 
+                    />
                   </div>
                 ))}
               </div>
@@ -976,7 +981,7 @@ export default function RoomPage() {
             } transition-colors flex items-center justify-center`}
             title={
               !deviceInfo?.supportsScreenShare
-                ? 'Screen sharing not supported on this device'
+                ? 'Screen sharing not supported - please update your browser'
                 : isScreenSharing
                   ? 'Stop sharing'
                   : 'Share screen'
@@ -1127,6 +1132,266 @@ function VideoCard({
           ) : (
             <span className={`${isMainView ? 'text-8xl' : 'text-6xl'}`}>👤</span>
           )}
+        </div>
+      )}
+    </>
+  );
+}
+
+function LocalScreenShare({
+  stream,
+  userName,
+}: {
+  stream: MediaStream | null;
+  userName: string;
+}) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const playAttemptedRef = useRef(false);
+
+  useEffect(() => {
+    if (!stream || !videoRef.current) {
+      console.log('LocalScreenShare: No stream or video ref');
+      return;
+    }
+
+    const videoElement = videoRef.current;
+    console.log('LocalScreenShare: Setting up stream', stream.id);
+
+    // Set the stream
+    videoElement.srcObject = stream;
+    playAttemptedRef.current = false;
+
+    // Handle loaded metadata
+    const handleLoadedMetadata = () => {
+      if (playAttemptedRef.current) return;
+      playAttemptedRef.current = true;
+      
+      console.log('LocalScreenShare: Metadata loaded, attempting play');
+      videoElement.play()
+        .then(() => {
+          console.log('LocalScreenShare: Playing successfully');
+          setIsPlaying(true);
+          setError(null);
+        })
+        .catch((err) => {
+          console.error('LocalScreenShare: Play error:', err);
+          setError('Failed to play screen share');
+          // Retry after a short delay
+          setTimeout(() => {
+            videoElement.play()
+              .then(() => {
+                console.log('LocalScreenShare: Retry successful');
+                setIsPlaying(true);
+                setError(null);
+              })
+              .catch((retryErr) => {
+                console.error('LocalScreenShare: Retry failed:', retryErr);
+              });
+          }, 500);
+        });
+    };
+
+    // Handle play event
+    const handlePlay = () => {
+      console.log('LocalScreenShare: Play event fired');
+      setIsPlaying(true);
+      setError(null);
+    };
+
+    // Handle pause event
+    const handlePause = () => {
+      console.log('LocalScreenShare: Pause event fired');
+      setIsPlaying(false);
+    };
+
+    // Handle error event
+    const handleError = (e: Event) => {
+      console.error('LocalScreenShare: Video error:', e);
+      setError('Video playback error');
+    };
+
+    videoElement.addEventListener('loadedmetadata', handleLoadedMetadata);
+    videoElement.addEventListener('play', handlePlay);
+    videoElement.addEventListener('pause', handlePause);
+    videoElement.addEventListener('error', handleError);
+
+    // If metadata is already loaded, play immediately
+    if (videoElement.readyState >= 1) {
+      handleLoadedMetadata();
+    }
+
+    return () => {
+      videoElement.removeEventListener('loadedmetadata', handleLoadedMetadata);
+      videoElement.removeEventListener('play', handlePlay);
+      videoElement.removeEventListener('pause', handlePause);
+      videoElement.removeEventListener('error', handleError);
+    };
+  }, [stream]);
+
+  return (
+    <>
+      <video
+        ref={videoRef}
+        autoPlay
+        muted
+        playsInline
+        className="w-full h-full object-contain bg-black"
+        style={{ maxHeight: '100%', maxWidth: '100%' }}
+      />
+      <div className="absolute bottom-4 left-4 bg-black bg-opacity-70 px-4 py-2 rounded-lg z-10">
+        <span className="text-sm font-semibold">{userName} (You) - Sharing Screen</span>
+      </div>
+      {!isPlaying && !error && (
+        <div className="absolute inset-0 flex items-center justify-center bg-gray-800">
+          <div className="text-center">
+            <div className="animate-spin rounded-full h-16 w-16 border-b-2 border-white mx-auto mb-4"></div>
+            <span className="text-lg">Starting screen share...</span>
+          </div>
+        </div>
+      )}
+      {error && (
+        <div className="absolute inset-0 flex items-center justify-center bg-gray-800">
+          <div className="text-center">
+            <span className="text-lg text-red-400">{error}</span>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+function LocalVideoStrip({
+  stream,
+  userName,
+  isVideoEnabled,
+}: {
+  stream: MediaStream | null;
+  userName: string;
+  isVideoEnabled: boolean;
+}) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+
+  useEffect(() => {
+    if (stream && videoRef.current) {
+      videoRef.current.srcObject = stream;
+      videoRef.current.play().catch(() => {});
+    }
+  }, [stream]);
+
+  return (
+    <div className="w-40 h-full relative bg-gray-800 rounded-lg overflow-hidden flex-shrink-0">
+      <video 
+        ref={videoRef}
+        autoPlay 
+        muted 
+        playsInline 
+        className="w-full h-full object-cover"
+      />
+      <div className="absolute bottom-2 left-2 bg-black bg-opacity-70 px-2 py-1 rounded text-xs z-10">
+        {userName} (You)
+      </div>
+      {!isVideoEnabled && (
+        <div className="absolute inset-0 flex items-center justify-center bg-gray-700">
+          <span className="text-3xl">👤</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function VideoCardStrip({
+  peer,
+  userName,
+  stream,
+}: {
+  peer: SimplePeer.Instance;
+  userName: string;
+  stream?: MediaStream;
+}) {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const [hasVideo, setHasVideo] = useState(true);
+  const [peerStream, setPeerStream] = useState<MediaStream | null>(null);
+
+  // Derive the active stream from props or peer stream
+  const activeStream = stream || peerStream;
+
+  // Listen for stream events from peer if stream prop is not provided
+  useEffect(() => {
+    if (!stream) {
+      const handleStream = (newStream: MediaStream) => {
+        console.log(`VideoCardStrip received stream for ${userName}:`, newStream.id);
+        setPeerStream(newStream);
+      };
+
+      peer.on('stream', handleStream);
+      return () => {
+        peer.off('stream', handleStream);
+      };
+    }
+  }, [peer, stream, userName]);
+
+  // Update video element when stream changes
+  useEffect(() => {
+    if (!activeStream || !videoRef.current) return;
+
+    console.log(`Setting video srcObject for ${userName}:`, activeStream.id);
+    const videoElement = videoRef.current;
+    videoElement.srcObject = activeStream;
+    videoElement.play().catch((err) => {
+      console.error(`Error playing video for ${userName}:`, err);
+    });
+    
+    const videoTrack = activeStream.getVideoTracks()[0];
+    if (!videoTrack) return;
+
+    // Set up event listeners for track state changes
+    const updateVideoState = (enabled: boolean) => {
+      setHasVideo(enabled);
+    };
+
+    const handleEnded = () => updateVideoState(false);
+    const handleMute = () => updateVideoState(false);
+    const handleUnmute = () => updateVideoState(true);
+    
+    // Initialize state from track
+    updateVideoState(videoTrack.enabled);
+    
+    videoTrack.addEventListener('ended', handleEnded);
+    videoTrack.addEventListener('mute', handleMute);
+    videoTrack.addEventListener('unmute', handleUnmute);
+    
+    return () => {
+      videoTrack.removeEventListener('ended', handleEnded);
+      videoTrack.removeEventListener('mute', handleMute);
+      videoTrack.removeEventListener('unmute', handleUnmute);
+    };
+  }, [activeStream, userName]);
+
+  return (
+    <>
+      <video
+        ref={videoRef}
+        autoPlay
+        playsInline
+        muted={false}
+        className="w-full h-full object-cover"
+      />
+      <div className="absolute bottom-2 left-2 bg-black bg-opacity-70 px-2 py-1 rounded text-xs z-10">
+        {userName}
+      </div>
+      {!hasVideo && activeStream && (
+        <div className="absolute inset-0 flex items-center justify-center bg-gray-700">
+          <span className="text-3xl">👤</span>
+        </div>
+      )}
+      {!activeStream && (
+        <div className="absolute inset-0 flex items-center justify-center bg-gray-700">
+          <div className="text-center">
+            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-white mx-auto mb-1"></div>
+            <span className="text-xs">Connecting...</span>
+          </div>
         </div>
       )}
     </>

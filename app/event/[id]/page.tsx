@@ -80,7 +80,7 @@ export default function EventPage() {
           <div className="text-6xl mb-6">😕</div>
           <h1 className="text-3xl font-bold text-white mb-4">Event Not Found</h1>
           <p className="text-gray-400 mb-8">
-            The event you're looking for doesn't exist or has been removed.
+            The event you&apos;re looking for doesn&apos;t exist or has been removed.
           </p>
           <Link
             href="/"

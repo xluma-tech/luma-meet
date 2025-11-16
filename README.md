@@ -99,8 +99,10 @@ Start command: `npm start`
 
 - ✅ Chrome/Edge (Desktop) - Full support
 - ✅ Firefox (Desktop) - Full support
-- ✅ Safari (Desktop) - Partial support (no cursor in screen share)
-- ✅ Mobile browsers - Camera only (no screen share)
+- ✅ Safari (Desktop) - Full support
+- ✅ Chrome/Edge (Android) - Full support including screen share
+- ✅ Safari (iOS 15.4+) - Full support including screen share
+- ✅ Firefox (Android) - Full support including screen share
 
 ## Development
 
@@ -129,9 +131,11 @@ npm run lint
 - Close other apps using camera
 
 ### Screen share not working
-- Desktop browsers only
-- Allow screen share permission
-- Try different browser (Chrome recommended)
+- Allow screen share permission when prompted
+- iOS: Requires iOS 15.4+ and Safari
+- Android: Use Chrome, Edge, or Firefox
+- Desktop: All major browsers supported
+- Update to latest browser version if not working
 
 ### Connection issues
 - Check network/firewall
