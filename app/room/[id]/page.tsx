@@ -382,25 +382,39 @@ export default function RoomPage() {
 
         console.log('Screen track obtained:', screenTrack.label, screenTrack.getSettings());
 
-        // Set screen video immediately
-        if (screenVideoRef.current) {
-          screenVideoRef.current.srcObject = screenStream;
-          console.log('Screen video ref set');
+        // IMPORTANT: Set state FIRST to trigger layout change
+        setIsScreenSharing(true);
+        setScreenSharingUserId('local');
+
+        // Then set the video stream after a small delay to ensure ref is ready
+        setTimeout(() => {
+          if (screenVideoRef.current) {
+            screenVideoRef.current.srcObject = screenStream;
+            screenVideoRef.current.play().catch((err) => {
+              console.error('Error playing screen video:', err);
+            });
+            console.log('Screen video ref set and playing');
+          }
+        }, 100);
+
+        // Create new stream with screen video + original audio
+        const audioTrack = localStreamRef.current?.getAudioTracks()[0];
+        const newStream = new MediaStream([screenTrack]);
+        if (audioTrack) {
+          newStream.addTrack(audioTrack);
         }
 
-        // Replace video track for all connected peers
+        // Replace entire stream for all connected peers
         const replacePromises = peersRef.current.map(async ({ peer, userId }) => {
           try {
-            const pc = (peer as any)._pc;
-            if (pc && pc.getSenders) {
-              const videoSender = pc.getSenders().find((s: RTCRtpSender) => s.track?.kind === 'video');
-              if (videoSender && screenTrack) {
-                await videoSender.replaceTrack(screenTrack);
-                console.log(`Track replaced for peer ${userId}`);
-              }
+            // Remove old stream and add new one
+            if (localStreamRef.current) {
+              peer.removeStream(localStreamRef.current);
             }
+            peer.addStream(newStream);
+            console.log(`Stream replaced for peer ${userId}`);
           } catch (err) {
-            console.error(`Error replacing track for peer ${userId}:`, err);
+            console.error(`Error replacing stream for peer ${userId}:`, err);
           }
         });
 
@@ -412,8 +426,6 @@ export default function RoomPage() {
           stopScreenShare();
         };
 
-        setIsScreenSharing(true);
-        setScreenSharingUserId('local');
         socketRef.current?.emit('screen-share-started', { roomId });
         console.log('Screen sharing started successfully');
       } catch (err: any) {
@@ -430,39 +442,43 @@ export default function RoomPage() {
   };
 
   const stopScreenShare = () => {
+    console.log('Stopping screen share...');
+    
+    // Stop screen share tracks
     if (screenStreamRef.current) {
-      screenStreamRef.current.getTracks().forEach((track) => track.stop());
+      screenStreamRef.current.getTracks().forEach((track) => {
+        track.stop();
+        console.log('Stopped screen track:', track.label);
+      });
       screenStreamRef.current = null;
     }
 
-    if (localStreamRef.current) {
-      const videoTrack = localStreamRef.current.getVideoTracks()[0];
+    // Clear screen video element
+    if (screenVideoRef.current) {
+      screenVideoRef.current.srcObject = null;
+    }
 
+    // Restore original camera stream for all peers
+    if (localStreamRef.current) {
+      console.log('Restoring original camera stream');
+      
       peersRef.current.forEach(({ peer, userId }) => {
         try {
-          const pc = (peer as any)._pc;
-          if (pc && pc.getSenders) {
-            const videoSender = pc.getSenders().find((s: RTCRtpSender) => s.track?.kind === 'video');
-            if (videoSender && videoTrack) {
-              videoSender.replaceTrack(videoTrack).catch((err: any) => {
-                // Ignore errors if peer is already disconnected
-                if (!err.message?.includes('User-Initiated Abort')) {
-                  console.error(`Error restoring track for peer ${userId}:`, err);
-                }
-              });
-            }
-          }
+          // Remove screen stream and add back camera stream
+          peer.removeStream(new MediaStream()); // Remove any existing stream
+          peer.addStream(localStreamRef.current!);
+          console.log(`Camera stream restored for peer ${userId}`);
         } catch (err) {
-          // Ignore errors during cleanup
+          console.error('Error during stream restoration:', err);
         }
       });
     }
 
+    // Update state
     setIsScreenSharing(false);
-    if (screenSharingUserId === 'local') {
-      setScreenSharingUserId(null);
-    }
+    setScreenSharingUserId(null);
     socketRef.current?.emit('screen-share-stopped', { roomId });
+    console.log('Screen share stopped');
   };
 
   const sendMessage = (e: React.FormEvent) => {
@@ -588,13 +604,15 @@ export default function RoomPage() {
                   {screenSharingUserId === 'local' ? (
                     <>
                       <video
+                        key="screen-share-video"
                         ref={screenVideoRef}
                         autoPlay
                         muted
                         playsInline
-                        className="w-full h-full object-contain"
+                        className="w-full h-full object-contain bg-black"
+                        style={{ maxHeight: '100%', maxWidth: '100%' }}
                       />
-                      <div className="absolute bottom-4 left-4 bg-black bg-opacity-70 px-4 py-2 rounded-lg">
+                      <div className="absolute bottom-4 left-4 bg-black bg-opacity-70 px-4 py-2 rounded-lg z-10">
                         <span className="text-sm font-semibold">{userName} (You) - Sharing Screen</span>
                       </div>
                     </>
@@ -619,8 +637,15 @@ export default function RoomPage() {
 
               <div className="h-32 bg-gray-900 px-4 pb-4 flex gap-2 overflow-x-auto flex-shrink-0">
                 <div className="w-40 h-full relative bg-gray-800 rounded-lg overflow-hidden flex-shrink-0">
-                  <video ref={localVideoRef} autoPlay muted playsInline className="w-full h-full object-cover" />
-                  <div className="absolute bottom-2 left-2 bg-black bg-opacity-70 px-2 py-1 rounded text-xs">
+                  <video 
+                    key="local-camera-small"
+                    ref={localVideoRef} 
+                    autoPlay 
+                    muted 
+                    playsInline 
+                    className="w-full h-full object-cover" 
+                  />
+                  <div className="absolute bottom-2 left-2 bg-black bg-opacity-70 px-2 py-1 rounded text-xs z-10">
                     {userName} (You)
                   </div>
                   {!isVideoEnabled && (
@@ -870,9 +895,16 @@ function VideoCard({
         setStreamSet(true);
         
         // Force video to play
-        videoRef.current.play().catch((err) => {
-          console.error('Error playing video:', err);
-        });
+        const playPromise = videoRef.current.play();
+        if (playPromise !== undefined) {
+          playPromise.catch((err) => {
+            console.error('Error playing video:', err);
+            // Try again after a short delay
+            setTimeout(() => {
+              videoRef.current?.play().catch(console.error);
+            }, 100);
+          });
+        }
       }
 
       const videoTrack = stream.getVideoTracks()[0];
