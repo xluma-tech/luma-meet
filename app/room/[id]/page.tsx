@@ -1,9 +1,11 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useMemo, useCallback } from 'react';
 import { useParams, useSearchParams } from 'next/navigation';
 import { io, Socket } from 'socket.io-client';
 import SimplePeer from 'simple-peer';
+import { usePictureInPicture } from './hooks/usePictureInPicture';
+import { FloatingWindow } from './components/FloatingWindow';
 
 // Development logging utility
 const isDev = process.env.NODE_ENV === 'development';
@@ -100,6 +102,11 @@ export default function RoomPage() {
   const [newMessage, setNewMessage] = useState('');
   const [selectedChatUser, setSelectedChatUser] = useState<string>('everyone');
   const [deviceInfo, setDeviceInfo] = useState<ReturnType<typeof getDeviceInfo> | null>(null);
+  const [pipEnabled, setPipEnabled] = useState(true);
+  const [showFloatingWindow, setShowFloatingWindow] = useState(false);
+  const [activeSpeaker, setActiveSpeaker] = useState<string | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserNodesRef = useRef<Map<string, AnalyserNode>>(new Map());
 
   const socketRef = useRef<Socket | null>(null);
   const localVideoRef = useRef<HTMLVideoElement>(null);
@@ -108,6 +115,117 @@ export default function RoomPage() {
   const screenPeersRef = useRef<ScreenPeer[]>([]); // Separate ref for screen peers
   const screenStreamRef = useRef<MediaStream | null>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
+
+  // Picture-in-Picture hook
+  const { isPiPActive, isPageHidden } = usePictureInPicture({
+    enabled: pipEnabled,
+    localStream: localStreamRef.current,
+    userName,
+    onError: (error) => {
+      // PiP failed (likely due to browser restrictions), use fallback
+      if (isPageHidden && pipEnabled) {
+        setShowFloatingWindow(true);
+      }
+    },
+  });
+
+  // Show floating window when page is hidden and PiP failed
+  // Keep it open until user manually closes it or disables the feature
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof document === 'undefined') return;
+
+    // Open floating window when page is hidden and PiP is not active
+    if (isPageHidden && pipEnabled && !isPiPActive && !showFloatingWindow) {
+      // Small delay to ensure page is actually hidden
+      const timer = setTimeout(() => {
+        if (document.hidden) {
+          setShowFloatingWindow(true);
+        }
+      }, 100);
+      return () => clearTimeout(timer);
+    }
+    
+    // Close floating window if PiP becomes active (prefer native PiP)
+    if (isPiPActive && showFloatingWindow) {
+      setShowFloatingWindow(false);
+    }
+    
+    // Close floating window if user disables the feature
+    if (!pipEnabled && showFloatingWindow) {
+      setShowFloatingWindow(false);
+    }
+  }, [isPageHidden, pipEnabled, isPiPActive, showFloatingWindow]);
+
+  // Audio level detection for active speaker
+  const setupAudioAnalyser = useCallback((stream: MediaStream, userId: string) => {
+    if (!stream) return;
+
+    try {
+      // Create audio context if it doesn't exist
+      if (!audioContextRef.current) {
+        audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+      }
+
+      const audioContext = audioContextRef.current;
+      const audioTrack = stream.getAudioTracks()[0];
+      
+      if (!audioTrack) return;
+
+      // Create analyser node
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 256;
+      analyser.smoothingTimeConstant = 0.8;
+
+      // Create media stream source
+      const source = audioContext.createMediaStreamSource(stream);
+      source.connect(analyser);
+
+      // Store analyser node
+      analyserNodesRef.current.set(userId, analyser);
+
+      devLog(`Audio analyser setup for ${userId}`);
+    } catch (err) {
+      console.error('Error setting up audio analyser:', err);
+    }
+  }, []);
+
+  const detectActiveSpeaker = useCallback(() => {
+    const analysers = analyserNodesRef.current;
+    if (analysers.size === 0) return;
+
+    let maxVolume = 0;
+    let loudestSpeaker: string | null = null;
+    const SPEAKING_THRESHOLD = 20; // Minimum volume to be considered speaking
+
+    analysers.forEach((analyser, userId) => {
+      const dataArray = new Uint8Array(analyser.frequencyBinCount);
+      analyser.getByteFrequencyData(dataArray);
+
+      // Calculate average volume
+      const average = dataArray.reduce((sum, value) => sum + value, 0) / dataArray.length;
+
+      if (average > maxVolume && average > SPEAKING_THRESHOLD) {
+        maxVolume = average;
+        loudestSpeaker = userId;
+      }
+    });
+
+    // If no one is speaking above threshold, clear active speaker
+    if (maxVolume <= SPEAKING_THRESHOLD) {
+      loudestSpeaker = null;
+    }
+
+    // Update active speaker if changed
+    if (loudestSpeaker !== activeSpeaker) {
+      setActiveSpeaker(loudestSpeaker);
+    }
+  }, [activeSpeaker]);
+
+  // Run speaker detection periodically
+  useEffect(() => {
+    const interval = setInterval(detectActiveSpeaker, 200); // Check every 200ms
+    return () => clearInterval(interval);
+  }, [detectActiveSpeaker]);
 
   // Peer creation functions - declared before useEffect to avoid hoisting issues
   const createPeer = (userToSignal: string, stream: MediaStream) => {
@@ -137,6 +255,9 @@ export default function RoomPage() {
         peersRef.current[peerIndex].stream = remoteStream;
         setPeers([...peersRef.current]);
         devLog(`Camera stream set for peer ${userToSignal}`);
+        
+        // Setup audio analyser for speaker detection
+        setupAudioAnalyser(remoteStream, userToSignal);
       }
     });
 
@@ -181,6 +302,9 @@ export default function RoomPage() {
         peersRef.current[peerIndex].stream = remoteStream;
         setPeers([...peersRef.current]);
         console.log(`Camera stream set for peer ${incomingSignal}`);
+        
+        // Setup audio analyser for speaker detection
+        setupAudioAnalyser(remoteStream, incomingSignal);
       }
     });
 
@@ -326,6 +450,9 @@ export default function RoomPage() {
           localVideoRef.current.srcObject = stream;
         }
 
+        // Setup audio analyser for local stream
+        setupAudioAnalyser(stream, 'local');
+
         socketRef.current?.emit('join-room', { roomId, userName });
 
         socketRef.current?.on('existing-users', (users: Array<{ userId: string; userName: string }>) => {
@@ -381,6 +508,12 @@ export default function RoomPage() {
           }
           peersRef.current = peersRef.current.filter((p) => p.userId !== userId);
           setPeers(peersRef.current);
+
+          // Remove audio analyser
+          analyserNodesRef.current.delete(userId);
+          if (activeSpeaker === userId) {
+            setActiveSpeaker(null);
+          }
 
           if (screenSharingUserId === userId) {
             setScreenSharingUserId(null);
@@ -478,6 +611,13 @@ export default function RoomPage() {
       peersRef.current.forEach((p) => p.peer.destroy());
       screenPeersRef.current.forEach((p) => p.peer.destroy());
       socketRef.current?.disconnect();
+      
+      // Cleanup audio context
+      if (audioContextRef.current) {
+        audioContextRef.current.close();
+        audioContextRef.current = null;
+      }
+      analyserNodesRef.current.clear();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomId, userName]);
@@ -501,25 +641,7 @@ export default function RoomPage() {
     }
   }, [screenSharingUserId]); // Re-run when screen sharing state changes
 
-  const toggleAudio = () => {
-    if (localStreamRef.current) {
-      const audioTrack = localStreamRef.current.getAudioTracks()[0];
-      if (audioTrack) {
-        audioTrack.enabled = !audioTrack.enabled;
-        setIsAudioEnabled(audioTrack.enabled);
-      }
-    }
-  };
 
-  const toggleVideo = () => {
-    if (localStreamRef.current) {
-      const videoTrack = localStreamRef.current.getVideoTracks()[0];
-      if (videoTrack) {
-        videoTrack.enabled = !videoTrack.enabled;
-        setIsVideoEnabled(videoTrack.enabled);
-      }
-    }
-  };
 
   const toggleScreenShare = async () => {
     if (!isScreenSharing) {
@@ -753,24 +875,70 @@ export default function RoomPage() {
         );
 
   const totalParticipants = peers.length + 1;
-  const getGridClass = () => {
+  
+  // Memoize grid class calculation for performance - Google Meet style
+  const gridClass = useMemo(() => {
     if (screenSharingUserId) return '';
+    // Mobile: Always 2 columns for square tiles (Google Meet style)
+    // Desktop: More columns for larger screens
     if (totalParticipants === 1) return 'grid-cols-1';
-    if (totalParticipants === 2) return 'grid-cols-1 md:grid-cols-2';
-    if (totalParticipants <= 4) return 'grid-cols-1 md:grid-cols-2';
-    if (totalParticipants <= 6) return 'grid-cols-2 md:grid-cols-3';
     return 'grid-cols-2 md:grid-cols-3 lg:grid-cols-4';
-  };
+  }, [totalParticipants, screenSharingUserId]);
+
+  // Sort participants to put active speaker first
+  const sortedPeers = useMemo(() => {
+    if (!activeSpeaker) return peers;
+    
+    const sorted = [...peers];
+    const activePeerIndex = sorted.findIndex(p => p.userId === activeSpeaker);
+    
+    if (activePeerIndex > -1) {
+      const [activePeer] = sorted.splice(activePeerIndex, 1);
+      sorted.unshift(activePeer);
+    }
+    
+    return sorted;
+  }, [peers, activeSpeaker]);
+
+  // Memoize toggle functions to prevent unnecessary re-renders
+  const handleToggleAudio = useCallback(() => {
+    if (localStreamRef.current) {
+      const audioTrack = localStreamRef.current.getAudioTracks()[0];
+      if (audioTrack) {
+        audioTrack.enabled = !audioTrack.enabled;
+        setIsAudioEnabled(audioTrack.enabled);
+      }
+    }
+  }, []);
+
+  const handleToggleVideo = useCallback(() => {
+    if (localStreamRef.current) {
+      const videoTrack = localStreamRef.current.getVideoTracks()[0];
+      if (videoTrack) {
+        videoTrack.enabled = !videoTrack.enabled;
+        setIsVideoEnabled(videoTrack.enabled);
+      }
+    }
+  }, []);
 
   return (
-    <div className="h-screen bg-gray-900 text-white flex flex-col">
-      <div className="bg-gray-800 px-4 py-3 flex items-center justify-between border-b border-gray-700 flex-shrink-0">
-        <div>
-          <h2 className="text-lg font-semibold">Room: {roomId}</h2>
+    <>
+      {/* Floating Window (fallback for browsers without PiP support) */}
+      <FloatingWindow
+        stream={localStreamRef.current}
+        userName={userName}
+        isVisible={showFloatingWindow}
+        onClose={() => setShowFloatingWindow(false)}
+      />
+
+      <div className="h-screen bg-gray-900 text-white flex flex-col">
+        <div className="bg-gray-800 px-3 md:px-4 py-2 md:py-3 flex items-center justify-between border-b border-gray-700 flex-shrink-0">
+        <div className="flex-1">
+          <h2 className="text-base md:text-lg font-semibold">Room: {roomId}</h2>
           <p className="text-xs text-gray-400">
             {totalParticipants} participant{totalParticipants !== 1 ? 's' : ''}
             {deviceInfo && (
-              <span className="ml-2 opacity-60">
+              <span className="ml-2 opacity-60 hidden sm:inline">
                 • {deviceInfo.isMobile ? '📱' : deviceInfo.isTablet ? '📱' : '💻'}{' '}
                 {deviceInfo.isChrome
                   ? 'Chrome'
@@ -783,39 +951,73 @@ export default function RoomPage() {
                         : 'Browser'}
               </span>
             )}
+            {isPiPActive && (
+              <span className="ml-2 text-blue-400">
+                • 🖼️ PiP Active
+              </span>
+            )}
           </p>
         </div>
-        <button
-          onClick={() => setShowChat(!showChat)}
-          className="p-2 rounded-lg bg-gray-700 hover:bg-gray-600 transition-colors relative flex items-center justify-center"
-        >
-          <svg
-            className="w-6 h-6"
-            fill="none"
-            stroke="currentColor"
-            viewBox="0 0 24 24"
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setPipEnabled(!pipEnabled)}
+            className={`p-2 rounded-lg ${
+              pipEnabled ? 'bg-blue-600 hover:bg-blue-700' : 'bg-gray-700 hover:bg-gray-600'
+            } transition-colors hidden sm:flex items-center justify-center touch-manipulation`}
+            title={pipEnabled ? 'Disable floating window' : 'Enable floating window'}
+            aria-label={pipEnabled ? 'Disable floating window' : 'Enable floating window'}
           >
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              strokeWidth={2}
-              d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"
-            />
-          </svg>
-          {messages.length > 0 && !showChat && (
-            <span className="absolute -top-1 -right-1 bg-red-600 text-xs rounded-full w-5 h-5 flex items-center justify-center">
-              {messages.length}
-            </span>
-          )}
-        </button>
-      </div>
+            <svg
+              className="w-5 h-5"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+              aria-hidden="true"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth={2}
+                d="M7 4v16M17 4v16M3 8h18M3 12h18M3 16h18"
+              />
+            </svg>
+          </button>
+          <button
+          onClick={() => setShowChat(!showChat)}
+            className="p-2 rounded-lg bg-gray-700 hover:bg-gray-600 transition-colors relative flex items-center justify-center touch-manipulation"
+            aria-label={showChat ? 'Close chat' : 'Open chat'}
+            aria-expanded={showChat}
+          >
+            <svg
+              className="w-5 h-5 md:w-6 md:h-6"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+              aria-hidden="true"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth={2}
+                d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"
+              />
+            </svg>
+            {messages.length > 0 && !showChat && (
+              <span className="absolute -top-1 -right-1 bg-red-600 text-xs rounded-full w-5 h-5 flex items-center justify-center" aria-label={`${messages.length} unread messages`}>
+                {messages.length}
+              </span>
+            )}
+          </button>
+        </div>
+        </div>
 
       <div className="flex-1 flex overflow-hidden">
         <div className="flex-1 flex flex-col overflow-hidden">
           {screenSharingUserId ? (
             <>
-              <div className="flex-1 bg-black p-4 overflow-hidden">
-                <div className="h-full bg-gray-900 rounded-lg overflow-hidden relative">
+              {/* Screen share view - Rectangle at top on mobile */}
+              <div className="bg-black p-2 md:p-4 flex-shrink-0 md:flex-1 md:overflow-hidden">
+                <div className="w-full aspect-video md:h-full bg-gray-900 rounded-lg overflow-hidden relative">
                   {screenSharingUserId === 'local' ? (
                     <LocalScreenShare 
                       stream={screenStreamRef.current} 
@@ -850,33 +1052,55 @@ export default function RoomPage() {
                 </div>
               </div>
 
-              <div className="h-32 bg-gray-900 px-4 pb-4 flex gap-2 overflow-x-auto flex-shrink-0">
-                {/* Always show local camera in strip when screen sharing is active */}
-                <LocalVideoStrip 
-                  stream={localStreamRef.current} 
-                  userName={userName} 
-                  isVideoEnabled={isVideoEnabled}
-                />
-
-                {/* Show all other participants' cameras */}
-                {peers.map((peer) => (
-                  <div
-                    key={`strip-${peer.userId}`}
-                    className="w-40 h-full relative bg-gray-800 rounded-lg overflow-hidden flex-shrink-0"
+              {/* User video tiles - Square grid on mobile (Google Meet style) */}
+              <div className="flex-1 bg-gray-900 px-2 md:px-4 pb-2 md:pb-4 overflow-y-auto">
+                <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-2 md:gap-3">
+                  {/* Local video - Square with active speaker glow */}
+                  <div 
+                    className={`relative bg-gray-800 rounded-lg overflow-hidden aspect-square transition-all duration-300 ${
+                      activeSpeaker === 'local' 
+                        ? 'ring-4 ring-blue-500 shadow-[0_0_20px_rgba(59,130,246,0.6)]' 
+                        : ''
+                    }`}
                   >
-                    <VideoCardStrip 
-                      key={`video-${peer.userId}-${peer.stream?.id || 'no-stream'}`}
-                      peer={peer.peer} 
-                      userName={peer.userName} 
-                      stream={peer.stream} 
+                    <LocalVideoStrip 
+                      stream={localStreamRef.current} 
+                      userName={userName} 
+                      isVideoEnabled={isVideoEnabled}
                     />
                   </div>
-                ))}
+
+                  {/* Other participants - Square, sorted with active speaker first */}
+                  {sortedPeers.map((peer) => (
+                    <div
+                      key={`strip-${peer.userId}`}
+                      className={`relative bg-gray-800 rounded-lg overflow-hidden aspect-square transition-all duration-300 ${
+                        activeSpeaker === peer.userId 
+                          ? 'ring-4 ring-blue-500 shadow-[0_0_20px_rgba(59,130,246,0.6)]' 
+                          : ''
+                      }`}
+                    >
+                      <VideoCardStrip 
+                        key={`video-${peer.userId}-${peer.stream?.id || 'no-stream'}`}
+                        peer={peer.peer} 
+                        userName={peer.userName} 
+                        stream={peer.stream} 
+                      />
+                    </div>
+                  ))}
+                </div>
               </div>
             </>
           ) : (
-            <div className={`flex-1 p-4 grid ${getGridClass()} gap-4 auto-rows-fr overflow-auto`}>
-              <div className="relative bg-gray-800 rounded-lg overflow-hidden min-h-[200px]">
+            <div className={`flex-1 p-2 md:p-4 grid ${gridClass} gap-2 md:gap-4 auto-rows-fr overflow-auto`}>
+              {/* Local video - with active speaker glow */}
+              <div 
+                className={`relative bg-gray-800 rounded-lg overflow-hidden aspect-square md:aspect-auto md:min-h-[200px] transition-all duration-300 ${
+                  activeSpeaker === 'local' 
+                    ? 'ring-4 ring-blue-500 shadow-[0_0_20px_rgba(59,130,246,0.6)]' 
+                    : ''
+                }`}
+              >
                 <video 
                   key="local-camera-grid"
                   ref={localVideoRef} 
@@ -885,18 +1109,26 @@ export default function RoomPage() {
                   playsInline 
                   className="w-full h-full object-cover" 
                 />
-                <div className="absolute bottom-2 left-2 bg-black bg-opacity-70 px-3 py-1 rounded text-sm">
+                <div className="absolute bottom-1 left-1 md:bottom-2 md:left-2 bg-black bg-opacity-70 px-2 py-1 md:px-3 rounded text-xs md:text-sm">
                   {userName} (You)
                 </div>
                 {!isVideoEnabled && (
                   <div className="absolute inset-0 flex items-center justify-center bg-gray-700">
-                    <span className="text-6xl">👤</span>
+                    <span className="text-4xl md:text-6xl">👤</span>
                   </div>
                 )}
               </div>
 
-              {peers.map((peer) => (
-                <div key={peer.userId} className="relative bg-gray-800 rounded-lg overflow-hidden min-h-[200px]">
+              {/* Other participants - sorted with active speaker first */}
+              {sortedPeers.map((peer) => (
+                <div 
+                  key={peer.userId} 
+                  className={`relative bg-gray-800 rounded-lg overflow-hidden aspect-square md:aspect-auto md:min-h-[200px] transition-all duration-300 ${
+                    activeSpeaker === peer.userId 
+                      ? 'ring-4 ring-blue-500 shadow-[0_0_20px_rgba(59,130,246,0.6)]' 
+                      : ''
+                  }`}
+                >
                   <VideoCard 
                     key={`grid-${peer.userId}-${peer.stream?.id || 'no-stream'}`}
                     peer={peer.peer} 
@@ -911,9 +1143,20 @@ export default function RoomPage() {
         </div>
 
         {showChat && (
-          <div className="w-full md:w-80 bg-gray-800 border-l border-gray-700 flex flex-col flex-shrink-0">
-            <div className="p-4 border-b border-gray-700 flex-shrink-0">
-              <h3 className="font-semibold mb-2">Chat</h3>
+          <div className="absolute md:relative inset-0 md:inset-auto w-full md:w-80 bg-gray-800 md:border-l border-gray-700 flex flex-col flex-shrink-0 z-50">
+            <div className="p-3 md:p-4 border-b border-gray-700 flex-shrink-0 flex items-center justify-between">
+              <h3 className="font-semibold">Chat</h3>
+              <button
+                onClick={() => setShowChat(false)}
+                className="md:hidden p-1 rounded hover:bg-gray-700 touch-manipulation"
+                aria-label="Close chat"
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+            <div className="px-3 md:px-4 pt-2 pb-3 border-b border-gray-700 flex-shrink-0">
               <select
                 value={selectedChatUser}
                 onChange={(e) => setSelectedChatUser(e.target.value)}
@@ -927,29 +1170,29 @@ export default function RoomPage() {
                 ))}
               </select>
             </div>
-            <div className="flex-1 overflow-y-auto p-4 space-y-2">
+            <div className="flex-1 overflow-y-auto p-3 md:p-4 space-y-2">
               {filteredMessages.length === 0 ? (
                 <div className="text-center text-gray-500 text-sm mt-4">
                   {selectedChatUser === 'everyone' ? 'No messages yet' : 'No private messages yet'}
                 </div>
               ) : (
                 filteredMessages.map((msg) => (
-                  <div key={msg.id} className={`rounded-lg p-3 ${msg.isPrivate ? 'bg-blue-900' : 'bg-gray-700'}`}>
+                  <div key={msg.id} className={`rounded-lg p-2 md:p-3 ${msg.isPrivate ? 'bg-blue-900' : 'bg-gray-700'}`}>
                     <div className="flex items-center justify-between mb-1">
-                      <span className="text-sm font-semibold text-blue-400">
+                      <span className="text-xs md:text-sm font-semibold text-blue-400">
                         {msg.userName} {msg.isPrivate && '🔒'}
                       </span>
                       <span className="text-xs text-gray-400">
                         {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                       </span>
                     </div>
-                    <p className="text-sm break-words">{msg.message}</p>
+                    <p className="text-xs md:text-sm break-words">{msg.message}</p>
                   </div>
                 ))
               )}
               <div ref={chatEndRef} />
             </div>
-            <form onSubmit={sendMessage} className="p-4 border-t border-gray-700 flex-shrink-0">
+            <form onSubmit={sendMessage} className="p-3 md:p-4 border-t border-gray-700 flex-shrink-0">
               <div className="flex gap-2">
                 <input
                   type="text"
@@ -960,11 +1203,11 @@ export default function RoomPage() {
                       ? 'everyone'
                       : peers.find((p) => p.userId === selectedChatUser)?.userName
                   }...`}
-                  className="flex-1 bg-gray-700 rounded-lg px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  className="flex-1 bg-gray-700 rounded-lg px-3 md:px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
                 />
                 <button
                   type="submit"
-                  className="bg-blue-600 hover:bg-blue-700 rounded-lg px-4 py-2 text-sm font-semibold transition-colors"
+                  className="bg-blue-600 hover:bg-blue-700 rounded-lg px-3 md:px-4 py-2 text-sm font-semibold transition-colors"
                 >
                   Send
                 </button>
@@ -974,20 +1217,22 @@ export default function RoomPage() {
         )}
       </div>
 
-      <div className="bg-gray-800 border-t border-gray-700 p-4 flex-shrink-0">
-        <div className="flex justify-center gap-3">
+      <div className="bg-gray-800 border-t border-gray-700 p-3 md:p-4 flex-shrink-0">
+        <div className="flex justify-center gap-2 md:gap-3">
           <button
-            onClick={toggleAudio}
-            className={`p-3 rounded-full ${
+            onClick={handleToggleAudio}
+            className={`p-2 md:p-3 rounded-full ${
               isAudioEnabled ? 'bg-gray-700 hover:bg-gray-600' : 'bg-red-600 hover:bg-red-700'
-            } transition-colors flex items-center justify-center`}
+            } transition-colors flex items-center justify-center touch-manipulation`}
             title={isAudioEnabled ? 'Mute' : 'Unmute'}
+            aria-label={isAudioEnabled ? 'Mute microphone' : 'Unmute microphone'}
           >
             <svg
-              className="w-6 h-6"
+              className="w-5 h-5 md:w-6 md:h-6"
               fill="none"
               stroke="currentColor"
               viewBox="0 0 24 24"
+              aria-hidden="true"
             >
               {isAudioEnabled ? (
                 <path
@@ -1008,17 +1253,19 @@ export default function RoomPage() {
           </button>
 
           <button
-            onClick={toggleVideo}
-            className={`p-3 rounded-full ${
+            onClick={handleToggleVideo}
+            className={`p-2 md:p-3 rounded-full ${
               isVideoEnabled ? 'bg-gray-700 hover:bg-gray-600' : 'bg-red-600 hover:bg-red-700'
-            } transition-colors flex items-center justify-center`}
+            } transition-colors flex items-center justify-center touch-manipulation`}
             title={isVideoEnabled ? 'Stop video' : 'Start video'}
+            aria-label={isVideoEnabled ? 'Turn off camera' : 'Turn on camera'}
           >
             <svg
-              className="w-6 h-6"
+              className="w-5 h-5 md:w-6 md:h-6"
               fill="none"
               stroke="currentColor"
               viewBox="0 0 24 24"
+              aria-hidden="true"
             >
               {isVideoEnabled ? (
                 <path
@@ -1040,13 +1287,13 @@ export default function RoomPage() {
 
           <button
             onClick={toggleScreenShare}
-            className={`p-3 rounded-full ${
+            className={`p-2 md:p-3 rounded-full ${
               isScreenSharing
                 ? 'bg-blue-600 hover:bg-blue-700'
                 : deviceInfo?.supportsScreenShare
                   ? 'bg-gray-700 hover:bg-gray-600'
                   : 'bg-gray-600 opacity-50 cursor-not-allowed'
-            } transition-colors flex items-center justify-center`}
+            } transition-colors flex items-center justify-center touch-manipulation`}
             title={
               !deviceInfo?.supportsScreenShare
                 ? 'Screen sharing not supported - please update your browser'
@@ -1054,13 +1301,15 @@ export default function RoomPage() {
                   ? 'Stop sharing'
                   : 'Share screen'
             }
+            aria-label={isScreenSharing ? 'Stop screen sharing' : 'Start screen sharing'}
             disabled={!deviceInfo?.supportsScreenShare}
           >
             <svg
-              className="w-6 h-6"
+              className="w-5 h-5 md:w-6 md:h-6"
               fill="none"
               stroke="currentColor"
               viewBox="0 0 24 24"
+              aria-hidden="true"
             >
               {isScreenSharing ? (
                 <path
@@ -1082,14 +1331,16 @@ export default function RoomPage() {
 
           <button
             onClick={leaveRoom}
-            className="p-3 px-6 rounded-full bg-red-600 hover:bg-red-700 transition-colors font-semibold"
+            className="p-2 md:p-3 px-4 md:px-6 rounded-full bg-red-600 hover:bg-red-700 transition-colors font-semibold text-sm md:text-base touch-manipulation"
             title="Leave meeting"
+            aria-label="Leave meeting"
           >
             Leave
           </button>
         </div>
       </div>
-    </div>
+      </div>
+    </>
   );
 }
 
@@ -1182,21 +1433,21 @@ function VideoCard({
       />
       <div
         className={`absolute ${
-          isMainView ? 'bottom-4 left-4 px-4 py-2 rounded-lg' : 'bottom-2 left-2 px-3 py-1 rounded'
+          isMainView ? 'bottom-2 left-2 md:bottom-4 md:left-4 px-3 py-1 md:px-4 md:py-2 rounded-lg' : 'bottom-1 left-1 md:bottom-2 md:left-2 px-2 py-1 md:px-3 rounded'
         } bg-black bg-opacity-70`}
       >
-        <span className={`${isMainView ? 'text-sm font-semibold' : 'text-sm'}`}>{userName}</span>
+        <span className={`${isMainView ? 'text-xs md:text-sm font-semibold' : 'text-xs md:text-sm'}`}>{userName}</span>
       </div>
       {!hasVideo && currentStream && (
         <div className="absolute inset-0 flex items-center justify-center bg-gray-700">
-          <span className={`${isMainView ? 'text-8xl' : 'text-6xl'}`}>👤</span>
+          <span className={`${isMainView ? 'text-5xl md:text-8xl' : 'text-4xl md:text-6xl'}`}>👤</span>
         </div>
       )}
       {!currentStream && (
         <div className="absolute inset-0 flex items-center justify-center bg-gray-700">
           <div className="text-center">
-            <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-white mx-auto mb-2"></div>
-            <span className="text-sm">Connecting...</span>
+            <div className="animate-spin rounded-full h-8 w-8 md:h-12 md:w-12 border-b-2 border-white mx-auto mb-2"></div>
+            <span className="text-xs md:text-sm">Connecting...</span>
           </div>
         </div>
       )}
@@ -1306,21 +1557,21 @@ function LocalScreenShare({
         className="w-full h-full object-contain bg-black"
         style={{ maxHeight: '100%', maxWidth: '100%' }}
       />
-      <div className="absolute bottom-4 left-4 bg-black bg-opacity-70 px-4 py-2 rounded-lg z-10">
-        <span className="text-sm font-semibold">{userName} (You) - Sharing Screen</span>
+      <div className="absolute bottom-2 left-2 md:bottom-4 md:left-4 bg-black bg-opacity-70 px-3 py-1 md:px-4 md:py-2 rounded-lg z-10">
+        <span className="text-xs md:text-sm font-semibold">{userName} (You) - Sharing Screen</span>
       </div>
       {!isPlaying && !error && (
         <div className="absolute inset-0 flex items-center justify-center bg-gray-800">
           <div className="text-center">
-            <div className="animate-spin rounded-full h-16 w-16 border-b-2 border-white mx-auto mb-4"></div>
-            <span className="text-lg">Starting screen share...</span>
+            <div className="animate-spin rounded-full h-12 w-12 md:h-16 md:w-16 border-b-2 border-white mx-auto mb-3 md:mb-4"></div>
+            <span className="text-sm md:text-lg">Starting screen share...</span>
           </div>
         </div>
       )}
       {error && (
         <div className="absolute inset-0 flex items-center justify-center bg-gray-800">
-          <div className="text-center">
-            <span className="text-lg text-red-400">{error}</span>
+          <div className="text-center px-4">
+            <span className="text-sm md:text-lg text-red-400">{error}</span>
           </div>
         </div>
       )}
@@ -1347,7 +1598,7 @@ function LocalVideoStrip({
   }, [stream]);
 
   return (
-    <div className="w-40 h-full relative bg-gray-800 rounded-lg overflow-hidden flex-shrink-0">
+    <>
       <video 
         ref={videoRef}
         autoPlay 
@@ -1355,15 +1606,15 @@ function LocalVideoStrip({
         playsInline 
         className="w-full h-full object-cover"
       />
-      <div className="absolute bottom-2 left-2 bg-black bg-opacity-70 px-2 py-1 rounded text-xs z-10">
+      <div className="absolute bottom-1 left-1 md:bottom-2 md:left-2 bg-black bg-opacity-70 px-2 py-1 rounded text-xs z-10">
         {userName} (You)
       </div>
       {!isVideoEnabled && (
         <div className="absolute inset-0 flex items-center justify-center bg-gray-700">
-          <span className="text-3xl">👤</span>
+          <span className="text-2xl md:text-3xl">👤</span>
         </div>
       )}
-    </div>
+    </>
   );
 }
 
@@ -1444,18 +1695,18 @@ function VideoCardStrip({
         muted={false}
         className="w-full h-full object-cover"
       />
-      <div className="absolute bottom-2 left-2 bg-black bg-opacity-70 px-2 py-1 rounded text-xs z-10">
+      <div className="absolute bottom-1 left-1 md:bottom-2 md:left-2 bg-black bg-opacity-70 px-2 py-1 rounded text-xs z-10">
         {userName}
       </div>
       {!hasVideo && activeStream && (
         <div className="absolute inset-0 flex items-center justify-center bg-gray-700">
-          <span className="text-3xl">👤</span>
+          <span className="text-2xl md:text-3xl">👤</span>
         </div>
       )}
       {!activeStream && (
         <div className="absolute inset-0 flex items-center justify-center bg-gray-700">
           <div className="text-center">
-            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-white mx-auto mb-1"></div>
+            <div className="animate-spin rounded-full h-6 w-6 md:h-8 md:w-8 border-b-2 border-white mx-auto mb-1"></div>
             <span className="text-xs">Connecting...</span>
           </div>
         </div>
