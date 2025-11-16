@@ -22,6 +22,32 @@ interface ChatMessage {
   recipientId?: string;
 }
 
+// Device and browser detection utilities
+const getDeviceInfo = () => {
+  const ua = navigator.userAgent;
+  const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(ua);
+  const isTablet = /iPad|Android(?!.*Mobile)/i.test(ua);
+  const isIOS = /iPhone|iPad|iPod/i.test(ua);
+  const isAndroid = /Android/i.test(ua);
+  const isSafari = /^((?!chrome|android).)*safari/i.test(ua);
+  const isChrome = /Chrome/i.test(ua) && /Google Inc/.test(navigator.vendor);
+  const isFirefox = /Firefox/i.test(ua);
+  const isEdge = /Edg/i.test(ua);
+
+  return {
+    isMobile: isMobile && !isTablet,
+    isTablet,
+    isDesktop: !isMobile && !isTablet,
+    isIOS,
+    isAndroid,
+    isSafari,
+    isChrome,
+    isFirefox,
+    isEdge,
+    supportsScreenShare: !isIOS && !isAndroid && typeof navigator.mediaDevices?.getDisplayMedia === 'function',
+  };
+};
+
 export default function RoomPage() {
   const resolvedParams = useParams<{ id: string }>();
   const resolvedSearchParams = useSearchParams();
@@ -37,6 +63,7 @@ export default function RoomPage() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [newMessage, setNewMessage] = useState('');
   const [selectedChatUser, setSelectedChatUser] = useState<string>('everyone');
+  const [deviceInfo, setDeviceInfo] = useState<ReturnType<typeof getDeviceInfo> | null>(null);
 
   const socketRef = useRef<Socket | null>(null);
   const localVideoRef = useRef<HTMLVideoElement>(null);
@@ -47,13 +74,49 @@ export default function RoomPage() {
   const chatEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
+    // Detect device and browser info
+    const info = getDeviceInfo();
+    setDeviceInfo(info);
+    console.log('Device Info:', info);
+
     const socketUrl = process.env.NEXT_PUBLIC_SOCKET_URL || window.location.origin;
     socketRef.current = io(socketUrl, {
       transports: ['websocket', 'polling'],
     });
 
+    // Optimize video constraints based on device
+    const getVideoConstraints = () => {
+      if (info.isMobile) {
+        return {
+          width: { ideal: 640, max: 1280 },
+          height: { ideal: 480, max: 720 },
+          frameRate: { ideal: 24, max: 30 },
+          facingMode: 'user',
+        };
+      } else if (info.isTablet) {
+        return {
+          width: { ideal: 1280, max: 1920 },
+          height: { ideal: 720, max: 1080 },
+          frameRate: { ideal: 30 },
+        };
+      } else {
+        return {
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
+          frameRate: { ideal: 30 },
+        };
+      }
+    };
+
     navigator.mediaDevices
-      .getUserMedia({ video: true, audio: true })
+      .getUserMedia({
+        video: getVideoConstraints(),
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      })
       .then((stream) => {
         localStreamRef.current = stream;
         if (localVideoRef.current) {
@@ -185,8 +248,16 @@ export default function RoomPage() {
       }
     });
 
-    peer.on('error', (err) => {
+    peer.on('error', (err: any) => {
+      // Ignore expected errors from user-initiated disconnections
+      if (err.message?.includes('User-Initiated Abort') || err.message?.includes('Close called')) {
+        return;
+      }
       console.error('Peer error:', err);
+    });
+
+    peer.on('close', () => {
+      // Peer connection closed, cleanup handled in user-left event
     });
 
     return peer;
@@ -217,8 +288,16 @@ export default function RoomPage() {
       }
     });
 
-    peer.on('error', (err) => {
+    peer.on('error', (err: any) => {
+      // Ignore expected errors from user-initiated disconnections
+      if (err.message?.includes('User-Initiated Abort') || err.message?.includes('Close called')) {
+        return;
+      }
       console.error('Peer error:', err);
+    });
+
+    peer.on('close', () => {
+      // Peer connection closed, cleanup handled in user-left event
     });
 
     return peer;
@@ -247,10 +326,61 @@ export default function RoomPage() {
   const toggleScreenShare = async () => {
     if (!isScreenSharing) {
       try {
-        const screenStream = await navigator.mediaDevices.getDisplayMedia({
-          video: { cursor: 'always' } as MediaTrackConstraints,
-          audio: false,
-        });
+        // Check device support
+        if (!deviceInfo?.supportsScreenShare) {
+          let message = 'Screen sharing is not supported on this device.';
+          if (deviceInfo?.isIOS) {
+            message = 'Screen sharing is not available on iOS devices. Please use a desktop browser.';
+          } else if (deviceInfo?.isAndroid) {
+            message = 'Screen sharing is not available on Android mobile browsers. Please use Chrome on desktop.';
+          }
+          alert(message);
+          return;
+        }
+
+        // Optimize screen share settings based on device
+        const getScreenShareConstraints = () => {
+          const baseConstraints: any = {
+            audio: false,
+          };
+
+          if (deviceInfo?.isDesktop) {
+            if (deviceInfo.isChrome || deviceInfo.isEdge) {
+              baseConstraints.video = {
+                cursor: 'always',
+                displaySurface: 'monitor',
+                width: { ideal: 1920, max: 1920 },
+                height: { ideal: 1080, max: 1080 },
+                frameRate: { ideal: 30, max: 30 },
+              };
+            } else if (deviceInfo.isFirefox) {
+              baseConstraints.video = {
+                width: { ideal: 1920 },
+                height: { ideal: 1080 },
+                frameRate: { ideal: 30 },
+              };
+            } else if (deviceInfo.isSafari) {
+              baseConstraints.video = {
+                width: { ideal: 1280 },
+                height: { ideal: 720 },
+                frameRate: { ideal: 24 },
+              };
+            } else {
+              baseConstraints.video = true;
+            }
+          } else {
+            // Fallback for other devices
+            baseConstraints.video = {
+              width: { ideal: 1280 },
+              height: { ideal: 720 },
+              frameRate: { ideal: 24 },
+            };
+          }
+
+          return baseConstraints;
+        };
+
+        const screenStream = await navigator.mediaDevices.getDisplayMedia(getScreenShareConstraints());
 
         screenStreamRef.current = screenStream;
         const screenTrack = screenStream.getVideoTracks()[0];
@@ -259,11 +389,17 @@ export default function RoomPage() {
           screenVideoRef.current.srcObject = screenStream;
         }
 
-        peersRef.current.forEach(({ peer }) => {
+        // Replace video track for all connected peers
+        peersRef.current.forEach(({ peer, userId }) => {
           try {
-            const videoSender = (peer as any)._pc?.getSenders().find((s: RTCRtpSender) => s.track?.kind === 'video');
-            if (videoSender) {
-              videoSender.replaceTrack(screenTrack);
+            const pc = (peer as any)._pc;
+            if (pc && pc.getSenders) {
+              const videoSender = pc.getSenders().find((s: RTCRtpSender) => s.track?.kind === 'video');
+              if (videoSender && screenTrack) {
+                videoSender.replaceTrack(screenTrack).catch((err: any) => {
+                  console.error(`Error replacing track for peer ${userId}:`, err);
+                });
+              }
             }
           } catch (err) {
             console.error('Error replacing track:', err);
@@ -277,8 +413,13 @@ export default function RoomPage() {
         setIsScreenSharing(true);
         setScreenSharingUserId('local');
         socketRef.current?.emit('screen-share-started', { roomId });
-      } catch (err) {
+      } catch (err: any) {
         console.error('Error sharing screen:', err);
+        if (err.name === 'NotAllowedError') {
+          // User cancelled screen share
+          return;
+        }
+        alert('Failed to share screen. Please try again.');
       }
     } else {
       stopScreenShare();
@@ -294,14 +435,22 @@ export default function RoomPage() {
     if (localStreamRef.current) {
       const videoTrack = localStreamRef.current.getVideoTracks()[0];
 
-      peersRef.current.forEach(({ peer }) => {
+      peersRef.current.forEach(({ peer, userId }) => {
         try {
-          const videoSender = (peer as any)._pc?.getSenders().find((s: RTCRtpSender) => s.track?.kind === 'video');
-          if (videoSender && videoTrack) {
-            videoSender.replaceTrack(videoTrack);
+          const pc = (peer as any)._pc;
+          if (pc && pc.getSenders) {
+            const videoSender = pc.getSenders().find((s: RTCRtpSender) => s.track?.kind === 'video');
+            if (videoSender && videoTrack) {
+              videoSender.replaceTrack(videoTrack).catch((err: any) => {
+                // Ignore errors if peer is already disconnected
+                if (!err.message?.includes('User-Initiated Abort')) {
+                  console.error(`Error restoring track for peer ${userId}:`, err);
+                }
+              });
+            }
           }
         } catch (err) {
-          console.error('Error restoring track:', err);
+          // Ignore errors during cleanup
         }
       });
     }
@@ -386,13 +535,39 @@ export default function RoomPage() {
           <h2 className="text-lg font-semibold">Room: {roomId}</h2>
           <p className="text-xs text-gray-400">
             {totalParticipants} participant{totalParticipants !== 1 ? 's' : ''}
+            {deviceInfo && (
+              <span className="ml-2 opacity-60">
+                • {deviceInfo.isMobile ? '📱' : deviceInfo.isTablet ? '📱' : '💻'}{' '}
+                {deviceInfo.isChrome
+                  ? 'Chrome'
+                  : deviceInfo.isFirefox
+                    ? 'Firefox'
+                    : deviceInfo.isSafari
+                      ? 'Safari'
+                      : deviceInfo.isEdge
+                        ? 'Edge'
+                        : 'Browser'}
+              </span>
+            )}
           </p>
         </div>
         <button
           onClick={() => setShowChat(!showChat)}
-          className="p-2 rounded-lg bg-gray-700 hover:bg-gray-600 transition-colors relative"
+          className="p-2 rounded-lg bg-gray-700 hover:bg-gray-600 transition-colors relative flex items-center justify-center"
         >
-          <span className="text-xl">💬</span>
+          <svg
+            className="w-6 h-6"
+            fill="none"
+            stroke="currentColor"
+            viewBox="0 0 24 24"
+          >
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              strokeWidth={2}
+              d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"
+            />
+          </svg>
           {messages.length > 0 && !showChat && (
             <span className="absolute -top-1 -right-1 bg-red-600 text-xs rounded-full w-5 h-5 flex items-center justify-center">
               {messages.length}
@@ -557,30 +732,104 @@ export default function RoomPage() {
             onClick={toggleAudio}
             className={`p-3 rounded-full ${
               isAudioEnabled ? 'bg-gray-700 hover:bg-gray-600' : 'bg-red-600 hover:bg-red-700'
-            } transition-colors`}
+            } transition-colors flex items-center justify-center`}
             title={isAudioEnabled ? 'Mute' : 'Unmute'}
           >
-            <span className="text-xl">{isAudioEnabled ? '🎤' : '🔇'}</span>
+            <svg
+              className="w-6 h-6"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+            >
+              {isAudioEnabled ? (
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"
+                />
+              ) : (
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z M17 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2"
+                />
+              )}
+            </svg>
           </button>
 
           <button
             onClick={toggleVideo}
             className={`p-3 rounded-full ${
               isVideoEnabled ? 'bg-gray-700 hover:bg-gray-600' : 'bg-red-600 hover:bg-red-700'
-            } transition-colors`}
+            } transition-colors flex items-center justify-center`}
             title={isVideoEnabled ? 'Stop video' : 'Start video'}
           >
-            <span className="text-xl">{isVideoEnabled ? '📹' : '📵'}</span>
+            <svg
+              className="w-6 h-6"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+            >
+              {isVideoEnabled ? (
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"
+                />
+              ) : (
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636"
+                />
+              )}
+            </svg>
           </button>
 
           <button
             onClick={toggleScreenShare}
             className={`p-3 rounded-full ${
-              isScreenSharing ? 'bg-blue-600 hover:bg-blue-700' : 'bg-gray-700 hover:bg-gray-600'
-            } transition-colors`}
-            title={isScreenSharing ? 'Stop sharing' : 'Share screen'}
+              isScreenSharing
+                ? 'bg-blue-600 hover:bg-blue-700'
+                : deviceInfo?.supportsScreenShare
+                  ? 'bg-gray-700 hover:bg-gray-600'
+                  : 'bg-gray-600 opacity-50 cursor-not-allowed'
+            } transition-colors flex items-center justify-center`}
+            title={
+              !deviceInfo?.supportsScreenShare
+                ? 'Screen sharing not supported on this device'
+                : isScreenSharing
+                  ? 'Stop sharing'
+                  : 'Share screen'
+            }
+            disabled={!deviceInfo?.supportsScreenShare}
           >
-            <span className="text-xl">🖥️</span>
+            <svg
+              className="w-6 h-6"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+            >
+              {isScreenSharing ? (
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z"
+                />
+              ) : (
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"
+                />
+              )}
+            </svg>
           </button>
 
           <button
