@@ -447,9 +447,9 @@ export default function RoomPage() {
 
         socketRef.current?.on('screen-share-stopped', ({ userId }) => {
           console.log(`User ${userId} stopped screen sharing`);
-          if (screenSharingUserId === userId) {
-            setScreenSharingUserId(null);
-          }
+          
+          // Always clear screenSharingUserId if it matches
+          setScreenSharingUserId((current) => (current === userId ? null : current));
           
           // Destroy screen peer
           const screenPeer = screenPeersRef.current.find((p) => p.userId === userId);
@@ -640,15 +640,20 @@ export default function RoomPage() {
       }
     });
     
-    // Clear screen peers
+    // Clear screen peers first
     screenPeersRef.current = [];
     setScreenPeers([]);
 
-    // Update state
+    // Update state - clear these AFTER peers are destroyed
     setIsScreenSharing(false);
     setScreenSharingUserId(null);
+    
+    // Notify server
     socketRef.current?.emit('screen-share-stopped', { roomId });
     console.log('Screen share stopped, camera restored');
+    
+    // Force a re-render by updating peers state
+    setPeers([...peersRef.current]);
   };
 
   const sendMessage = (e: React.FormEvent) => {
@@ -779,7 +784,19 @@ export default function RoomPage() {
                   ) : (
                     (() => {
                       const sharingPeer = screenPeers.find((p) => p.userId === screenSharingUserId);
-                      return sharingPeer ? (
+                      
+                      // Safety check: if peer not found, clear screenSharingUserId
+                      if (!sharingPeer) {
+                        // Clear the state asynchronously to avoid setState during render
+                        Promise.resolve().then(() => setScreenSharingUserId(null));
+                        return (
+                          <div className="w-full h-full flex items-center justify-center bg-gray-800">
+                            <span className="text-gray-400">Screen share ended</span>
+                          </div>
+                        );
+                      }
+                      
+                      return (
                         <VideoCard
                           key={`screen-${sharingPeer.userId}-${sharingPeer.stream?.id || 'no-stream'}`}
                           peer={sharingPeer.peer}
@@ -787,10 +804,6 @@ export default function RoomPage() {
                           stream={sharingPeer.stream}
                           isMainView={true}
                         />
-                      ) : (
-                        <div className="w-full h-full flex items-center justify-center bg-gray-800">
-                          <span className="text-gray-400">Loading screen share...</span>
-                        </div>
                       );
                     })()
                   )}
