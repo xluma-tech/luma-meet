@@ -13,6 +13,13 @@ const devLog = (...args: unknown[]) => {
   }
 };
 
+// Production error tracking (can be replaced with Sentry, LogRocket, etc.)
+const trackError = (error: Error, context?: string) => {
+  console.error(`[${context || 'Error'}]:`, error);
+  // TODO: Send to error tracking service in production
+  // Example: Sentry.captureException(error, { tags: { context } });
+};
+
 interface Peer {
   peer: SimplePeer.Instance;
   userId: string;
@@ -137,7 +144,7 @@ export default function RoomPage() {
       if (err.message?.includes('User-Initiated Abort') || err.message?.includes('Close called')) {
         return;
       }
-      console.error('Peer error:', err);
+      trackError(err, 'Camera Peer Connection');
     });
 
     peer.on('close', () => {
@@ -479,6 +486,21 @@ export default function RoomPage() {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
+  // Ensure local video element is always connected to stream
+  useEffect(() => {
+    if (localVideoRef.current && localStreamRef.current) {
+      // Only set if not already set or if it's different
+      const currentSrc = localVideoRef.current.srcObject as MediaStream | null;
+      if (!currentSrc || currentSrc.id !== localStreamRef.current.id) {
+        devLog('Reconnecting local video stream');
+        localVideoRef.current.srcObject = localStreamRef.current;
+        localVideoRef.current.play().catch((err) => {
+          console.error('Error playing local video:', err);
+        });
+      }
+    }
+  }, [screenSharingUserId]); // Re-run when screen sharing state changes
+
   const toggleAudio = () => {
     if (localStreamRef.current) {
       const audioTrack = localStreamRef.current.getAudioTracks()[0];
@@ -523,13 +545,14 @@ export default function RoomPage() {
 
         const constraints: ScreenShareConstraints = {
           video: true,
-          audio: false,
+          audio: true, // Enable system audio capture
         };
 
         // Add device and browser-specific optimizations
         if (deviceInfo?.isIOS) {
           // iOS Safari - keep it simple, let the system handle it
           constraints.video = true;
+          constraints.audio = true; // iOS supports audio in screen share
         } else if (deviceInfo?.isMobile || deviceInfo?.isTablet) {
           // Android mobile/tablet optimizations
           if (typeof constraints.video !== 'boolean') {
@@ -539,14 +562,16 @@ export default function RoomPage() {
               frameRate: { ideal: 24 },
             };
           }
+          constraints.audio = true; // Android supports audio
         } else if (deviceInfo?.isChrome || deviceInfo?.isEdge) {
-          // Desktop Chrome/Edge
+          // Desktop Chrome/Edge - supports system audio
           constraints.video = {
             cursor: 'always',
             width: { ideal: 1920 },
             height: { ideal: 1080 },
             frameRate: { ideal: 30 },
           };
+          constraints.audio = true; // Request system audio
         } else if (deviceInfo?.isFirefox) {
           // Desktop Firefox
           constraints.video = {
@@ -554,31 +579,46 @@ export default function RoomPage() {
             width: { ideal: 1920 },
             height: { ideal: 1080 },
           };
+          constraints.audio = true; // Firefox supports audio
         } else if (deviceInfo?.isSafari && deviceInfo?.isDesktop) {
           // Desktop Safari
           constraints.video = {
             width: { ideal: 1920 },
             height: { ideal: 1080 },
           };
+          constraints.audio = true; // Safari supports audio
         }
 
         console.log('Starting screen share with constraints:', constraints);
         const screenStream = await navigator.mediaDevices.getDisplayMedia(constraints);
 
         screenStreamRef.current = screenStream;
-        const screenTrack = screenStream.getVideoTracks()[0];
+        const screenVideoTrack = screenStream.getVideoTracks()[0];
+        const screenAudioTrack = screenStream.getAudioTracks()[0]; // System audio from screen
 
-        console.log('Screen track obtained:', screenTrack.label, screenTrack.getSettings());
+        console.log('Screen tracks obtained:', {
+          video: screenVideoTrack?.label,
+          audio: screenAudioTrack?.label || 'No system audio',
+        });
 
         // Update state to trigger UI change
         setIsScreenSharing(true);
         setScreenSharingUserId('local');
 
-        // Create screen share stream with audio
-        const audioTrack = localStreamRef.current?.getAudioTracks()[0];
-        const screenStreamWithAudio = new MediaStream([screenTrack]);
-        if (audioTrack) {
-          screenStreamWithAudio.addTrack(audioTrack);
+        // Create screen share stream with both system audio and microphone
+        const micAudioTrack = localStreamRef.current?.getAudioTracks()[0];
+        const screenStreamWithAudio = new MediaStream([screenVideoTrack]);
+        
+        // Add system audio from screen share (if available)
+        if (screenAudioTrack) {
+          screenStreamWithAudio.addTrack(screenAudioTrack);
+          console.log('Added system audio to screen share');
+        }
+        
+        // Add microphone audio (if available)
+        if (micAudioTrack) {
+          screenStreamWithAudio.addTrack(micAudioTrack);
+          console.log('Added microphone audio to screen share');
         }
 
         // Create SEPARATE screen share peers (camera peers stay active!)
@@ -597,7 +637,7 @@ export default function RoomPage() {
         setScreenPeers([...screenPeersRef.current]);
 
         // Handle when user stops sharing via browser UI
-        screenTrack.onended = () => {
+        screenVideoTrack.onended = () => {
           console.log('Screen share ended by user');
           stopScreenShare();
         };
@@ -837,7 +877,14 @@ export default function RoomPage() {
           ) : (
             <div className={`flex-1 p-4 grid ${getGridClass()} gap-4 auto-rows-fr overflow-auto`}>
               <div className="relative bg-gray-800 rounded-lg overflow-hidden min-h-[200px]">
-                <video ref={localVideoRef} autoPlay muted playsInline className="w-full h-full object-cover" />
+                <video 
+                  key="local-camera-grid"
+                  ref={localVideoRef} 
+                  autoPlay 
+                  muted 
+                  playsInline 
+                  className="w-full h-full object-cover" 
+                />
                 <div className="absolute bottom-2 left-2 bg-black bg-opacity-70 px-3 py-1 rounded text-sm">
                   {userName} (You)
                 </div>

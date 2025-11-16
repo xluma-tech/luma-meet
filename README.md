@@ -6,7 +6,8 @@ A modern, real-time video conferencing application built with Next.js, Socket.io
 
 - 🎥 **HD Video Calls** - High-quality video with adaptive quality
 - 🎤 **Crystal Clear Audio** - Echo cancellation and noise suppression
-- 🖥️ **Screen Sharing** - Share your screen with participants (desktop only)
+- 🖥️ **Screen Sharing** - Share your screen with system audio on all platforms
+- 🔊 **System Audio Capture** - Share video/audio from your screen
 - 💬 **Real-time Chat** - Public and private messaging
 - 📱 **Responsive Design** - Works on desktop, tablet, and mobile
 - 🔒 **Secure** - Peer-to-peer WebRTC connections
@@ -132,10 +133,17 @@ npm run lint
 
 ### Screen share not working
 - Allow screen share permission when prompted
+- For audio: Check "Share audio" or "Share tab audio" in browser dialog
 - iOS: Requires iOS 15.4+ and Safari
 - Android: Use Chrome, Edge, or Firefox
 - Desktop: All major browsers supported
 - Update to latest browser version if not working
+
+### No audio from shared screen
+- Chrome/Edge: Check "Share audio" checkbox in screen share dialog
+- Firefox: Check "Share system audio" option
+- Safari: System audio is automatically included
+- Make sure the video/audio is playing on the shared screen
 
 ### Connection issues
 - Check network/firewall
