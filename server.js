@@ -86,6 +86,52 @@ app.prepare().then(() => {
       }
     });
 
+    socket.on('chat-message', ({ roomId, userName, message, timestamp }) => {
+      try {
+        socket.to(roomId).emit('chat-message', {
+          userId: socket.id,
+          userName,
+          message,
+          timestamp,
+        });
+      } catch (err) {
+        console.error('Error sending chat message:', err);
+      }
+    });
+
+    socket.on('private-message', ({ roomId, userName, message, timestamp, to }) => {
+      try {
+        io.to(to).emit('private-message', {
+          userId: socket.id,
+          userName,
+          message,
+          timestamp,
+        });
+      } catch (err) {
+        console.error('Error sending private message:', err);
+      }
+    });
+
+    socket.on('screen-share-started', ({ roomId }) => {
+      try {
+        socket.to(roomId).emit('screen-share-started', {
+          userId: socket.id,
+        });
+      } catch (err) {
+        console.error('Error broadcasting screen share start:', err);
+      }
+    });
+
+    socket.on('screen-share-stopped', ({ roomId }) => {
+      try {
+        socket.to(roomId).emit('screen-share-stopped', {
+          userId: socket.id,
+        });
+      } catch (err) {
+        console.error('Error broadcasting screen share stop:', err);
+      }
+    });
+
     socket.on('disconnect', () => {
       try {
         if (socket.roomId) {
