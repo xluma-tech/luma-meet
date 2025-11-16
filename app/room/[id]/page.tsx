@@ -162,8 +162,15 @@ export default function RoomPage() {
 
         socketRef.current?.on('signal', ({ from, signal }) => {
           const item = peersRef.current.find((p) => p.userId === from);
-          if (item) {
-            item.peer.signal(signal);
+          if (item && item.peer) {
+            try {
+              // Check if peer is not destroyed before signaling
+              if (!(item.peer as any).destroyed) {
+                item.peer.signal(signal);
+              }
+            } catch (err) {
+              console.error('Error signaling peer:', err);
+            }
           }
         });
 
@@ -382,11 +389,11 @@ export default function RoomPage() {
 
         console.log('Screen track obtained:', screenTrack.label, screenTrack.getSettings());
 
-        // IMPORTANT: Set state FIRST to trigger layout change
+        // Set state first to update UI
         setIsScreenSharing(true);
         setScreenSharingUserId('local');
 
-        // Then set the video stream after a small delay to ensure ref is ready
+        // Set screen video locally
         setTimeout(() => {
           if (screenVideoRef.current) {
             screenVideoRef.current.srcObject = screenStream;
@@ -397,28 +404,37 @@ export default function RoomPage() {
           }
         }, 100);
 
-        // Create new stream with screen video + original audio
-        const audioTrack = localStreamRef.current?.getAudioTracks()[0];
-        const newStream = new MediaStream([screenTrack]);
-        if (audioTrack) {
-          newStream.addTrack(audioTrack);
+        // Replace the video track in the local stream
+        if (localStreamRef.current) {
+          const oldVideoTrack = localStreamRef.current.getVideoTracks()[0];
+          if (oldVideoTrack) {
+            localStreamRef.current.removeTrack(oldVideoTrack);
+          }
+          localStreamRef.current.addTrack(screenTrack);
+          console.log('Screen track added to local stream');
         }
 
-        // Replace entire stream for all connected peers
-        const replacePromises = peersRef.current.map(async ({ peer, userId }) => {
+        // For each peer, replace the track using RTCRtpSender
+        peersRef.current.forEach(({ peer, userId }) => {
           try {
-            // Remove old stream and add new one
-            if (localStreamRef.current) {
-              peer.removeStream(localStreamRef.current);
+            const pc = (peer as any)._pc as RTCPeerConnection;
+            if (pc && pc.getSenders) {
+              const videoSender = pc.getSenders().find((s: RTCRtpSender) => s.track?.kind === 'video');
+              if (videoSender) {
+                videoSender.replaceTrack(screenTrack).then(() => {
+                  console.log(`Screen track sent to peer ${userId}`);
+                }).catch((err) => {
+                  console.error(`Error sending screen track to peer ${userId}:`, err);
+                });
+              }
             }
-            peer.addStream(newStream);
-            console.log(`Stream replaced for peer ${userId}`);
           } catch (err) {
-            console.error(`Error replacing stream for peer ${userId}:`, err);
+            console.error(`Error replacing track for peer ${userId}:`, err);
           }
         });
 
-        await Promise.all(replacePromises);
+        // Notify server we're starting screen share
+        socketRef.current?.emit('screen-share-started', { roomId });
 
         // Handle when user stops sharing via browser UI
         screenTrack.onended = () => {
@@ -441,7 +457,7 @@ export default function RoomPage() {
     }
   };
 
-  const stopScreenShare = () => {
+  const stopScreenShare = async () => {
     console.log('Stopping screen share...');
     
     // Stop screen share tracks
@@ -458,27 +474,75 @@ export default function RoomPage() {
       screenVideoRef.current.srcObject = null;
     }
 
-    // Restore original camera stream for all peers
-    if (localStreamRef.current) {
-      console.log('Restoring original camera stream');
-      
-      peersRef.current.forEach(({ peer, userId }) => {
-        try {
-          // Remove screen stream and add back camera stream
-          peer.removeStream(new MediaStream()); // Remove any existing stream
-          peer.addStream(localStreamRef.current!);
-          console.log(`Camera stream restored for peer ${userId}`);
-        } catch (err) {
-          console.error('Error during stream restoration:', err);
-        }
-      });
-    }
+    // Get the original camera stream
+    navigator.mediaDevices
+      .getUserMedia({
+        video: deviceInfo?.isMobile
+          ? { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 24 } }
+          : { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } },
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      })
+      .then((newCameraStream) => {
+        const newVideoTrack = newCameraStream.getVideoTracks()[0];
+        const newAudioTrack = newCameraStream.getAudioTracks()[0];
 
-    // Update state
-    setIsScreenSharing(false);
-    setScreenSharingUserId(null);
-    socketRef.current?.emit('screen-share-stopped', { roomId });
-    console.log('Screen share stopped');
+        // Replace tracks in local stream
+        if (localStreamRef.current) {
+          const oldVideoTrack = localStreamRef.current.getVideoTracks()[0];
+          const oldAudioTrack = localStreamRef.current.getAudioTracks()[0];
+
+          if (oldVideoTrack) {
+            localStreamRef.current.removeTrack(oldVideoTrack);
+          }
+          if (oldAudioTrack) {
+            localStreamRef.current.removeTrack(oldAudioTrack);
+          }
+
+          localStreamRef.current.addTrack(newVideoTrack);
+          localStreamRef.current.addTrack(newAudioTrack);
+
+          // Update local video element
+          if (localVideoRef.current) {
+            localVideoRef.current.srcObject = localStreamRef.current;
+          }
+
+          console.log('Camera tracks restored to local stream');
+        }
+
+        // For each peer, replace the track
+        peersRef.current.forEach(({ peer, userId }) => {
+          try {
+            const pc = (peer as any)._pc as RTCPeerConnection;
+            if (pc && pc.getSenders) {
+              const videoSender = pc.getSenders().find((s: RTCRtpSender) => s.track?.kind === 'video');
+              if (videoSender) {
+                videoSender.replaceTrack(newVideoTrack).then(() => {
+                  console.log(`Camera track sent to peer ${userId}`);
+                }).catch((err) => {
+                  console.error(`Error sending camera track to peer ${userId}:`, err);
+                });
+              }
+            }
+          } catch (err) {
+            console.error(`Error replacing track for peer ${userId}:`, err);
+          }
+        });
+
+        // Update state
+        setIsScreenSharing(false);
+        setScreenSharingUserId(null);
+        socketRef.current?.emit('screen-share-stopped', { roomId });
+        console.log('Screen share stopped, camera restored');
+      })
+      .catch((err) => {
+        console.error('Error getting camera stream:', err);
+        setIsScreenSharing(false);
+        setScreenSharingUserId(null);
+      });
   };
 
   const sendMessage = (e: React.FormEvent) => {
