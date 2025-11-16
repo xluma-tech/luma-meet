@@ -781,8 +781,10 @@ export default function RoomPage() {
                       const sharingPeer = screenPeers.find((p) => p.userId === screenSharingUserId);
                       return sharingPeer ? (
                         <VideoCard
+                          key={`screen-${sharingPeer.userId}-${sharingPeer.stream?.id || 'no-stream'}`}
                           peer={sharingPeer.peer}
                           userName={`${sharingPeer.userName} - Sharing Screen`}
+                          stream={sharingPeer.stream}
                           isMainView={true}
                         />
                       ) : (
@@ -835,7 +837,13 @@ export default function RoomPage() {
 
               {peers.map((peer) => (
                 <div key={peer.userId} className="relative bg-gray-800 rounded-lg overflow-hidden min-h-[200px]">
-                  <VideoCard peer={peer.peer} userName={peer.userName} isMainView={false} />
+                  <VideoCard 
+                    key={`grid-${peer.userId}-${peer.stream?.id || 'no-stream'}`}
+                    peer={peer.peer} 
+                    userName={peer.userName} 
+                    stream={peer.stream}
+                    isMainView={false} 
+                  />
                 </div>
               ))}
             </div>
@@ -1028,83 +1036,80 @@ export default function RoomPage() {
 function VideoCard({
   peer,
   userName,
+  stream,
   isMainView = false,
 }: {
   peer: SimplePeer.Instance;
   userName: string;
+  stream?: MediaStream;
   isMainView?: boolean;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [hasVideo, setHasVideo] = useState(true);
-  const [streamSet, setStreamSet] = useState(false);
+  const [currentStream, setCurrentStream] = useState<MediaStream | null>(stream || null);
 
+  // Listen for new stream events from peer
   useEffect(() => {
-    let currentStreamId: string | null = null;
-    let isHandlingStream = false;
-
-    const handleStream = (stream: MediaStream) => {
-      // Prevent concurrent handling
-      if (isHandlingStream) {
-        console.log('Already handling stream, skipping');
-        return;
-      }
-
-      // Prevent handling the same stream multiple times
-      if (currentStreamId === stream.id) {
-        console.log('Same stream already handled:', stream.id);
-        return;
-      }
-
-      isHandlingStream = true;
-      currentStreamId = stream.id;
-      
-      console.log('VideoCard handling new stream:', stream.id, 'tracks:', stream.getTracks().length);
-      
-      // Only update srcObject if it's actually different
-      if (videoRef.current) {
-        const currentSrc = videoRef.current.srcObject as MediaStream | null;
-        if (!currentSrc || currentSrc.id !== stream.id) {
-          videoRef.current.srcObject = stream;
-          setStreamSet(true);
-          
-          // Play video
-          videoRef.current.play().catch(() => {
-            // Retry once after a delay
-            setTimeout(() => {
-              if (videoRef.current) {
-                videoRef.current.play().catch(() => {});
-              }
-            }, 200);
-          });
-        }
-      }
-
-      // Setup track listeners
-      const videoTrack = stream.getVideoTracks()[0];
-      if (videoTrack) {
-        setHasVideo(videoTrack.enabled);
-        
-        // Clean up old listeners
-        videoTrack.onended = null;
-        videoTrack.onmute = null;
-        videoTrack.onunmute = null;
-        
-        // Add new listeners
-        videoTrack.onended = () => setHasVideo(false);
-        videoTrack.onmute = () => setHasVideo(false);
-        videoTrack.onunmute = () => setHasVideo(true);
-      }
-
-      isHandlingStream = false;
+    const handleStream = (newStream: MediaStream) => {
+      devLog('VideoCard received new stream:', newStream.id);
+      setCurrentStream(newStream);
     };
 
     peer.on('stream', handleStream);
 
     return () => {
       peer.off('stream', handleStream);
-      currentStreamId = null;
     };
   }, [peer]);
+
+  // Update current stream when prop changes
+  useEffect(() => {
+    if (stream && (!currentStream || stream.id !== currentStream.id)) {
+      devLog('VideoCard updating stream from prop:', stream.id);
+      // Use a microtask to avoid setState in effect warning
+      Promise.resolve().then(() => setCurrentStream(stream));
+    }
+  }, [stream, currentStream]);
+
+  // Handle video element and track listeners
+  useEffect(() => {
+    const activeStream = currentStream;
+    if (!activeStream || !videoRef.current) return;
+
+    devLog('VideoCard setting up video element:', activeStream.id);
+    const videoElement = videoRef.current;
+    
+    // Set stream to video element
+    videoElement.srcObject = activeStream;
+    videoElement.play().catch((err) => {
+      console.error('Error playing video:', err);
+      // Retry after delay
+      setTimeout(() => {
+        videoElement.play().catch(() => {});
+      }, 200);
+    });
+
+    // Setup track listeners
+    const videoTrack = activeStream.getVideoTracks()[0];
+    if (!videoTrack) return;
+
+    const handleEnded = () => setHasVideo(false);
+    const handleMute = () => setHasVideo(false);
+    const handleUnmute = () => setHasVideo(true);
+
+    // Initialize video state asynchronously to avoid setState in effect warning
+    Promise.resolve().then(() => setHasVideo(videoTrack.enabled));
+    
+    videoTrack.addEventListener('ended', handleEnded);
+    videoTrack.addEventListener('mute', handleMute);
+    videoTrack.addEventListener('unmute', handleUnmute);
+
+    return () => {
+      videoTrack.removeEventListener('ended', handleEnded);
+      videoTrack.removeEventListener('mute', handleMute);
+      videoTrack.removeEventListener('unmute', handleUnmute);
+    };
+  }, [currentStream]);
 
   return (
     <>
@@ -1122,16 +1127,17 @@ function VideoCard({
       >
         <span className={`${isMainView ? 'text-sm font-semibold' : 'text-sm'}`}>{userName}</span>
       </div>
-      {(!hasVideo || !streamSet) && (
+      {!hasVideo && currentStream && (
         <div className="absolute inset-0 flex items-center justify-center bg-gray-700">
-          {!streamSet ? (
-            <div className="text-center">
-              <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-white mx-auto mb-2"></div>
-              <span className="text-sm">Connecting...</span>
-            </div>
-          ) : (
-            <span className={`${isMainView ? 'text-8xl' : 'text-6xl'}`}>👤</span>
-          )}
+          <span className={`${isMainView ? 'text-8xl' : 'text-6xl'}`}>👤</span>
+        </div>
+      )}
+      {!currentStream && (
+        <div className="absolute inset-0 flex items-center justify-center bg-gray-700">
+          <div className="text-center">
+            <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-white mx-auto mb-2"></div>
+            <span className="text-sm">Connecting...</span>
+          </div>
         </div>
       )}
     </>
