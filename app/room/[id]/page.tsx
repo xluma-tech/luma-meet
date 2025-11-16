@@ -24,27 +24,37 @@ interface ChatMessage {
 
 // Device and browser detection utilities
 const getDeviceInfo = () => {
-  const ua = navigator.userAgent;
-  const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(ua);
-  const isTablet = /iPad|Android(?!.*Mobile)/i.test(ua);
-  const isIOS = /iPhone|iPad|iPod/i.test(ua);
-  const isAndroid = /Android/i.test(ua);
-  const isSafari = /^((?!chrome|android).)*safari/i.test(ua);
-  const isChrome = /Chrome/i.test(ua) && /Google Inc/.test(navigator.vendor);
-  const isFirefox = /Firefox/i.test(ua);
-  const isEdge = /Edg/i.test(ua);
+  const ua = navigator.userAgent.toLowerCase();
+  
+  // Detect mobile/tablet
+  const isMobile = /android|webos|iphone|ipod|blackberry|iemobile|opera mini/i.test(ua);
+  const isTablet = /ipad|android(?!.*mobile)/i.test(ua);
+  const isIOS = /iphone|ipad|ipod/i.test(ua);
+  const isAndroid = /android/i.test(ua);
+  
+  // Detect browser - order matters!
+  const isEdge = /edg/i.test(ua);
+  const isChrome = /chrome/i.test(ua) && !/edg/i.test(ua);
+  const isFirefox = /firefox/i.test(ua);
+  const isSafari = /safari/i.test(ua) && !/chrome/i.test(ua) && !/android/i.test(ua);
+  
+  // Screen share support - desktop only
+  const isDesktopDevice = !isMobile && !isTablet;
+  const hasGetDisplayMedia = typeof navigator.mediaDevices?.getDisplayMedia === 'function';
+  const supportsScreenShare = isDesktopDevice && hasGetDisplayMedia;
 
   return {
     isMobile: isMobile && !isTablet,
     isTablet,
-    isDesktop: !isMobile && !isTablet,
+    isDesktop: isDesktopDevice,
     isIOS,
     isAndroid,
     isSafari,
     isChrome,
     isFirefox,
     isEdge,
-    supportsScreenShare: !isIOS && !isAndroid && typeof navigator.mediaDevices?.getDisplayMedia === 'function',
+    supportsScreenShare,
+    userAgent: navigator.userAgent,
   };
 };
 
@@ -197,10 +207,12 @@ export default function RoomPage() {
         });
 
         socketRef.current?.on('screen-share-started', ({ userId }) => {
+          console.log(`User ${userId} started screen sharing`);
           setScreenSharingUserId(userId);
         });
 
         socketRef.current?.on('screen-share-stopped', ({ userId }) => {
+          console.log(`User ${userId} stopped screen sharing`);
           if (screenSharingUserId === userId) {
             setScreenSharingUserId(null);
           }
@@ -330,89 +342,80 @@ export default function RoomPage() {
         if (!deviceInfo?.supportsScreenShare) {
           let message = 'Screen sharing is not supported on this device.';
           if (deviceInfo?.isIOS) {
-            message = 'Screen sharing is not available on iOS devices. Please use a desktop browser.';
+            message = 'Screen sharing is not available on iOS. Please use Safari on macOS or Chrome on Windows/Mac.';
           } else if (deviceInfo?.isAndroid) {
-            message = 'Screen sharing is not available on Android mobile browsers. Please use Chrome on desktop.';
+            message = 'Screen sharing is not available on mobile. Please use a desktop browser.';
+          } else if (!deviceInfo?.isDesktop) {
+            message = 'Screen sharing is only available on desktop browsers.';
           }
           alert(message);
           return;
         }
 
-        // Optimize screen share settings based on device
-        const getScreenShareConstraints = () => {
-          const baseConstraints: any = {
-            audio: false,
-          };
-
-          if (deviceInfo?.isDesktop) {
-            if (deviceInfo.isChrome || deviceInfo.isEdge) {
-              baseConstraints.video = {
-                cursor: 'always',
-                displaySurface: 'monitor',
-                width: { ideal: 1920, max: 1920 },
-                height: { ideal: 1080, max: 1080 },
-                frameRate: { ideal: 30, max: 30 },
-              };
-            } else if (deviceInfo.isFirefox) {
-              baseConstraints.video = {
-                width: { ideal: 1920 },
-                height: { ideal: 1080 },
-                frameRate: { ideal: 30 },
-              };
-            } else if (deviceInfo.isSafari) {
-              baseConstraints.video = {
-                width: { ideal: 1280 },
-                height: { ideal: 720 },
-                frameRate: { ideal: 24 },
-              };
-            } else {
-              baseConstraints.video = true;
-            }
-          } else {
-            // Fallback for other devices
-            baseConstraints.video = {
-              width: { ideal: 1280 },
-              height: { ideal: 720 },
-              frameRate: { ideal: 24 },
-            };
-          }
-
-          return baseConstraints;
+        // Universal screen share constraints that work across all desktop browsers
+        const constraints: any = {
+          video: {
+            cursor: 'always',
+          },
+          audio: false,
         };
 
-        const screenStream = await navigator.mediaDevices.getDisplayMedia(getScreenShareConstraints());
+        // Add browser-specific optimizations
+        if (deviceInfo?.isChrome || deviceInfo?.isEdge) {
+          constraints.video.width = { ideal: 1920 };
+          constraints.video.height = { ideal: 1080 };
+          constraints.video.frameRate = { ideal: 30 };
+        } else if (deviceInfo?.isFirefox) {
+          constraints.video.mediaSource = 'screen';
+          constraints.video.width = { ideal: 1920 };
+          constraints.video.height = { ideal: 1080 };
+        } else if (deviceInfo?.isSafari) {
+          // Safari has more limited support
+          constraints.video = true;
+        }
+
+        console.log('Starting screen share with constraints:', constraints);
+        const screenStream = await navigator.mediaDevices.getDisplayMedia(constraints);
 
         screenStreamRef.current = screenStream;
         const screenTrack = screenStream.getVideoTracks()[0];
 
+        console.log('Screen track obtained:', screenTrack.label, screenTrack.getSettings());
+
+        // Set screen video immediately
         if (screenVideoRef.current) {
           screenVideoRef.current.srcObject = screenStream;
+          console.log('Screen video ref set');
         }
 
         // Replace video track for all connected peers
-        peersRef.current.forEach(({ peer, userId }) => {
+        const replacePromises = peersRef.current.map(async ({ peer, userId }) => {
           try {
             const pc = (peer as any)._pc;
             if (pc && pc.getSenders) {
               const videoSender = pc.getSenders().find((s: RTCRtpSender) => s.track?.kind === 'video');
               if (videoSender && screenTrack) {
-                videoSender.replaceTrack(screenTrack).catch((err: any) => {
-                  console.error(`Error replacing track for peer ${userId}:`, err);
-                });
+                await videoSender.replaceTrack(screenTrack);
+                console.log(`Track replaced for peer ${userId}`);
               }
             }
           } catch (err) {
-            console.error('Error replacing track:', err);
+            console.error(`Error replacing track for peer ${userId}:`, err);
           }
         });
 
+        await Promise.all(replacePromises);
+
+        // Handle when user stops sharing via browser UI
         screenTrack.onended = () => {
+          console.log('Screen share ended by user');
           stopScreenShare();
         };
 
         setIsScreenSharing(true);
         setScreenSharingUserId('local');
         socketRef.current?.emit('screen-share-started', { roomId });
+        console.log('Screen sharing started successfully');
       } catch (err: any) {
         console.error('Error sharing screen:', err);
         if (err.name === 'NotAllowedError') {
@@ -856,19 +859,49 @@ function VideoCard({
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [hasVideo, setHasVideo] = useState(true);
+  const [streamSet, setStreamSet] = useState(false);
 
   useEffect(() => {
-    peer.on('stream', (stream) => {
+    const handleStream = (stream: MediaStream) => {
+      console.log('VideoCard received stream:', stream.id, 'tracks:', stream.getTracks().length);
+      
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
+        setStreamSet(true);
+        
+        // Force video to play
+        videoRef.current.play().catch((err) => {
+          console.error('Error playing video:', err);
+        });
       }
 
       const videoTrack = stream.getVideoTracks()[0];
       if (videoTrack) {
+        console.log('Video track settings:', videoTrack.getSettings());
         setHasVideo(videoTrack.enabled);
-        videoTrack.onended = () => setHasVideo(false);
+        
+        videoTrack.onended = () => {
+          console.log('Video track ended');
+          setHasVideo(false);
+        };
+        
+        videoTrack.onmute = () => {
+          console.log('Video track muted');
+          setHasVideo(false);
+        };
+        
+        videoTrack.onunmute = () => {
+          console.log('Video track unmuted');
+          setHasVideo(true);
+        };
       }
-    });
+    };
+
+    peer.on('stream', handleStream);
+
+    return () => {
+      peer.off('stream', handleStream);
+    };
   }, [peer]);
 
   return (
@@ -877,7 +910,8 @@ function VideoCard({
         ref={videoRef}
         autoPlay
         playsInline
-        className={`w-full h-full ${isMainView ? 'object-contain' : 'object-cover'}`}
+        muted={false}
+        className={`w-full h-full ${isMainView ? 'object-contain bg-black' : 'object-cover'}`}
       />
       <div
         className={`absolute ${
@@ -886,9 +920,16 @@ function VideoCard({
       >
         <span className={`${isMainView ? 'text-sm font-semibold' : 'text-sm'}`}>{userName}</span>
       </div>
-      {!hasVideo && (
+      {(!hasVideo || !streamSet) && (
         <div className="absolute inset-0 flex items-center justify-center bg-gray-700">
-          <span className={`${isMainView ? 'text-8xl' : 'text-6xl'}`}>👤</span>
+          {!streamSet ? (
+            <div className="text-center">
+              <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-white mx-auto mb-2"></div>
+              <span className="text-sm">Connecting...</span>
+            </div>
+          ) : (
+            <span className={`${isMainView ? 'text-8xl' : 'text-6xl'}`}>👤</span>
+          )}
         </div>
       )}
     </>
