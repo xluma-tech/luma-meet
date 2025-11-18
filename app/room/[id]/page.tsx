@@ -101,6 +101,8 @@ export default function RoomPage() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [newMessage, setNewMessage] = useState('');
   const [selectedChatUser, setSelectedChatUser] = useState<string>('everyone');
+  const [userSearchQuery, setUserSearchQuery] = useState('');
+  const [showUserDropdown, setShowUserDropdown] = useState(false);
   const [deviceInfo, setDeviceInfo] = useState<ReturnType<typeof getDeviceInfo> | null>(null);
   const [pipEnabled, setPipEnabled] = useState(true);
   const [showFloatingWindow, setShowFloatingWindow] = useState(false);
@@ -129,12 +131,12 @@ export default function RoomPage() {
     },
   });
 
-  // Show floating window when page is hidden and PiP failed
-  // Keep it open until user manually closes it or disables the feature
+  // Automatic floating window when tab is minimized
+  // Shows screen share if active, otherwise shows local video
   useEffect(() => {
     if (typeof window === 'undefined' || typeof document === 'undefined') return;
 
-    // Open floating window when page is hidden and PiP is not active
+    // Automatically open floating window when page is hidden
     if (isPageHidden && pipEnabled && !isPiPActive && !showFloatingWindow) {
       // Small delay to ensure page is actually hidden
       const timer = setTimeout(() => {
@@ -143,6 +145,11 @@ export default function RoomPage() {
         }
       }, 100);
       return () => clearTimeout(timer);
+    }
+    
+    // Automatically close floating window when page becomes visible again
+    if (!isPageHidden && showFloatingWindow) {
+      setShowFloatingWindow(false);
     }
     
     // Close floating window if PiP becomes active (prefer native PiP)
@@ -155,6 +162,23 @@ export default function RoomPage() {
       setShowFloatingWindow(false);
     }
   }, [isPageHidden, pipEnabled, isPiPActive, showFloatingWindow]);
+
+  // Close user dropdown when clicking outside
+  useEffect(() => {
+    if (!showUserDropdown) return;
+
+    const handleClickOutside = (e: MouseEvent) => {
+      const target = e.target as HTMLElement;
+      // Check if click is outside the dropdown
+      if (!target.closest('.user-dropdown-container')) {
+        setShowUserDropdown(false);
+        setUserSearchQuery('');
+      }
+    };
+
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [showUserDropdown]);
 
   // Audio level detection for active speaker
   const setupAudioAnalyser = useCallback((stream: MediaStream, userId: string) => {
@@ -875,14 +899,33 @@ export default function RoomPage() {
         );
 
   const totalParticipants = peers.length + 1;
+
+  // Filter users based on search query
+  const filteredUsers = useMemo(() => {
+    if (!userSearchQuery.trim()) return peers;
+    const query = userSearchQuery.toLowerCase();
+    return peers.filter(peer => peer.userName.toLowerCase().includes(query));
+  }, [peers, userSearchQuery]);
+
+  // Get selected user name for display
+  const selectedUserName = useMemo(() => {
+    if (selectedChatUser === 'everyone') return 'Everyone';
+    const peer = peers.find(p => p.userId === selectedChatUser);
+    return peer ? `${peer.userName} (Private)` : 'Unknown User';
+  }, [selectedChatUser, peers]);
   
   // Memoize grid class calculation for performance - Google Meet style
   const gridClass = useMemo(() => {
     if (screenSharingUserId) return '';
-    // Mobile: Always 2 columns for square tiles (Google Meet style)
-    // Desktop: More columns for larger screens
-    if (totalParticipants === 1) return 'grid-cols-1';
-    return 'grid-cols-2 md:grid-cols-3 lg:grid-cols-4';
+    
+    // Responsive grid based on participant count (Google Meet style)
+    if (totalParticipants === 1) return 'grid-cols-1 place-items-center';
+    if (totalParticipants === 2) return 'grid-cols-1 md:grid-cols-2';
+    if (totalParticipants <= 4) return 'grid-cols-2 md:grid-cols-2 lg:grid-cols-2';
+    if (totalParticipants <= 6) return 'grid-cols-2 md:grid-cols-3';
+    if (totalParticipants <= 9) return 'grid-cols-2 md:grid-cols-3 lg:grid-cols-3';
+    if (totalParticipants <= 12) return 'grid-cols-2 md:grid-cols-3 lg:grid-cols-4';
+    return 'grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5';
   }, [totalParticipants, screenSharingUserId]);
 
   // Sort participants to put active speaker first
@@ -921,13 +964,97 @@ export default function RoomPage() {
     }
   }, []);
 
+  // Get the stream for floating window (screen share if active, otherwise local video)
+  const getFloatingWindowStream = useCallback(() => {
+    // If screen sharing, show screen share
+    if (screenSharingUserId) {
+      if (screenSharingUserId === 'local') {
+        const stream = screenStreamRef.current;
+        if (stream && stream.getTracks().length > 0) {
+          return { stream, userName: `${userName} (You) - Screen Share`, isScreenShare: true };
+        }
+      } else {
+        const peer = screenPeers.find(p => p.userId === screenSharingUserId);
+        const stream = peer?.stream;
+        if (stream && stream.getTracks().length > 0) {
+          return { stream, userName: `${peer?.userName || 'Unknown'} - Screen Share`, isScreenShare: true };
+        }
+      }
+    }
+    
+    // Otherwise show local video
+    const stream = localStreamRef.current;
+    if (stream && stream.getTracks().length > 0) {
+      return { stream, userName: `${userName} (You)`, isScreenShare: false };
+    }
+    
+    return null;
+  }, [screenSharingUserId, screenPeers, userName]);
+
+  const floatingWindowData = getFloatingWindowStream();
+
+  // Get all participants for floating window tabs
+  const getAllParticipants = useCallback(() => {
+    const participants = [];
+    
+    // Add screen share if active (highest priority)
+    if (screenSharingUserId) {
+      if (screenSharingUserId === 'local') {
+        const stream = screenStreamRef.current;
+        if (stream && stream.getTracks().length > 0) {
+          participants.push({ 
+            id: 'screen-local', 
+            stream, 
+            userName: `${userName} (You) - Screen Share`, 
+            isScreenShare: true 
+          });
+        }
+      } else {
+        const peer = screenPeers.find(p => p.userId === screenSharingUserId);
+        if (peer?.stream && peer.stream.getTracks().length > 0) {
+          participants.push({ 
+            id: `screen-${peer.userId}`, 
+            stream: peer.stream, 
+            userName: `${peer.userName} - Screen Share`, 
+            isScreenShare: true 
+          });
+        }
+      }
+    }
+    
+    // Add local video
+    if (localStreamRef.current && localStreamRef.current.getTracks().length > 0) {
+      participants.push({ 
+        id: 'local', 
+        stream: localStreamRef.current, 
+        userName: `${userName} (You)`, 
+        isScreenShare: false 
+      });
+    }
+    
+    // Add other participants
+    peers.forEach(peer => {
+      if (peer.stream && peer.stream.getTracks().length > 0) {
+        participants.push({ 
+          id: peer.userId, 
+          stream: peer.stream, 
+          userName: peer.userName, 
+          isScreenShare: false 
+        });
+      }
+    });
+    
+    return participants;
+  }, [screenSharingUserId, screenPeers, peers, userName]);
+
+  const allParticipants = getAllParticipants();
+
   return (
     <>
-      {/* Floating Window (fallback for browsers without PiP support) */}
+      {/* Floating Window with tabs - Shows all participants */}
       <FloatingWindow
-        stream={localStreamRef.current}
-        userName={userName}
-        isVisible={showFloatingWindow}
+        participants={allParticipants}
+        isVisible={showFloatingWindow && allParticipants.length > 0}
         onClose={() => setShowFloatingWindow(false)}
       />
 
@@ -1015,9 +1142,10 @@ export default function RoomPage() {
         <div className="flex-1 flex flex-col overflow-hidden">
           {screenSharingUserId ? (
             <>
-              {/* Screen share view - Rectangle at top on mobile */}
-              <div className="bg-black p-2 md:p-4 flex-shrink-0 md:flex-1 md:overflow-hidden">
-                <div className="w-full aspect-video md:h-full bg-gray-900 rounded-lg overflow-hidden relative">
+              {/* Screen share view - Zoom-style layout: Large screen share with horizontal participant strip */}
+              <div className="flex-1 bg-black p-2 md:p-4 flex flex-col overflow-hidden">
+                {/* Main screen share area */}
+                <div className="flex-1 bg-gray-900 rounded-lg overflow-hidden relative mb-2">
                   {screenSharingUserId === 'local' ? (
                     <LocalScreenShare 
                       stream={screenStreamRef.current} 
@@ -1050,56 +1178,57 @@ export default function RoomPage() {
                     })()
                   )}
                 </div>
-              </div>
 
-              {/* User video tiles - Square grid on mobile (Google Meet style) */}
-              <div className="flex-1 bg-gray-900 px-2 md:px-4 pb-2 md:pb-4 overflow-y-auto">
-                <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-2 md:gap-3">
-                  {/* Local video - Square with active speaker glow */}
-                  <div 
-                    className={`relative bg-gray-800 rounded-lg overflow-hidden aspect-square transition-all duration-300 ${
-                      activeSpeaker === 'local' 
-                        ? 'ring-4 ring-blue-500 shadow-[0_0_20px_rgba(59,130,246,0.6)]' 
-                        : ''
-                    }`}
-                  >
-                    <LocalVideoStrip 
-                      stream={localStreamRef.current} 
-                      userName={userName} 
-                      isVideoEnabled={isVideoEnabled}
-                    />
-                  </div>
-
-                  {/* Other participants - Square, sorted with active speaker first */}
-                  {sortedPeers.map((peer) => (
-                    <div
-                      key={`strip-${peer.userId}`}
-                      className={`relative bg-gray-800 rounded-lg overflow-hidden aspect-square transition-all duration-300 ${
-                        activeSpeaker === peer.userId 
-                          ? 'ring-4 ring-blue-500 shadow-[0_0_20px_rgba(59,130,246,0.6)]' 
+                {/* Horizontal scrollable participant strip at bottom (Zoom-style) */}
+                <div className="flex-shrink-0 h-24 md:h-32">
+                  <div className="flex gap-2 overflow-x-auto pb-1 h-full scrollbar-thin scrollbar-thumb-gray-600 scrollbar-track-gray-800">
+                    {/* Local video - Compact horizontal tile */}
+                    <div 
+                      className={`flex-shrink-0 w-32 md:w-40 h-full relative bg-gray-800 rounded-lg overflow-hidden transition-all duration-300 ${
+                        activeSpeaker === 'local' 
+                          ? 'ring-2 ring-blue-500 shadow-[0_0_15px_rgba(59,130,246,0.5)]' 
                           : ''
                       }`}
                     >
-                      <VideoCardStrip 
-                        key={`video-${peer.userId}-${peer.stream?.id || 'no-stream'}`}
-                        peer={peer.peer} 
-                        userName={peer.userName} 
-                        stream={peer.stream} 
+                      <LocalVideoStrip 
+                        stream={localStreamRef.current} 
+                        userName={userName} 
+                        isVideoEnabled={isVideoEnabled}
                       />
                     </div>
-                  ))}
+
+                    {/* Other participants - Compact horizontal tiles */}
+                    {sortedPeers.map((peer) => (
+                      <div
+                        key={`strip-${peer.userId}`}
+                        className={`flex-shrink-0 w-32 md:w-40 h-full relative bg-gray-800 rounded-lg overflow-hidden transition-all duration-300 ${
+                          activeSpeaker === peer.userId 
+                            ? 'ring-2 ring-blue-500 shadow-[0_0_15px_rgba(59,130,246,0.5)]' 
+                            : ''
+                        }`}
+                      >
+                        <VideoCardStrip 
+                          key={`video-${peer.userId}-${peer.stream?.id || 'no-stream'}`}
+                          peer={peer.peer} 
+                          userName={peer.userName} 
+                          stream={peer.stream} 
+                        />
+                      </div>
+                    ))}
+                  </div>
                 </div>
               </div>
             </>
           ) : (
-            <div className={`flex-1 p-2 md:p-4 grid ${gridClass} gap-2 md:gap-4 auto-rows-fr overflow-auto`}>
+            <div className={`flex-1 p-2 md:p-4 grid ${gridClass} gap-2 md:gap-3 overflow-auto content-start ${totalParticipants === 1 ? 'max-w-4xl mx-auto' : ''}`}>
               {/* Local video - with active speaker glow */}
               <div 
-                className={`relative bg-gray-800 rounded-lg overflow-hidden aspect-square md:aspect-auto md:min-h-[200px] transition-all duration-300 ${
+                className={`relative bg-gray-800 rounded-lg overflow-hidden min-h-[180px] transition-all duration-300 ${
                   activeSpeaker === 'local' 
                     ? 'ring-4 ring-blue-500 shadow-[0_0_20px_rgba(59,130,246,0.6)]' 
                     : ''
                 }`}
+                style={{ aspectRatio: '16/9' }}
               >
                 <video 
                   key="local-camera-grid"
@@ -1109,7 +1238,7 @@ export default function RoomPage() {
                   playsInline 
                   className="w-full h-full object-cover" 
                 />
-                <div className="absolute bottom-1 left-1 md:bottom-2 md:left-2 bg-black bg-opacity-70 px-2 py-1 md:px-3 rounded text-xs md:text-sm">
+                <div className="absolute bottom-1 left-1 md:bottom-2 md:left-2 bg-black bg-opacity-70 px-2 py-1 md:px-3 rounded text-xs md:text-sm z-10">
                   {userName} (You)
                 </div>
                 {!isVideoEnabled && (
@@ -1123,11 +1252,12 @@ export default function RoomPage() {
               {sortedPeers.map((peer) => (
                 <div 
                   key={peer.userId} 
-                  className={`relative bg-gray-800 rounded-lg overflow-hidden aspect-square md:aspect-auto md:min-h-[200px] transition-all duration-300 ${
+                  className={`relative bg-gray-800 rounded-lg overflow-hidden min-h-[180px] transition-all duration-300 ${
                     activeSpeaker === peer.userId 
                       ? 'ring-4 ring-blue-500 shadow-[0_0_20px_rgba(59,130,246,0.6)]' 
                       : ''
                   }`}
+                  style={{ aspectRatio: '16/9' }}
                 >
                   <VideoCard 
                     key={`grid-${peer.userId}-${peer.stream?.id || 'no-stream'}`}
@@ -1157,18 +1287,80 @@ export default function RoomPage() {
               </button>
             </div>
             <div className="px-3 md:px-4 pt-2 pb-3 border-b border-gray-700 flex-shrink-0">
-              <select
-                value={selectedChatUser}
-                onChange={(e) => setSelectedChatUser(e.target.value)}
-                className="w-full bg-gray-700 rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-              >
-                <option value="everyone">Everyone</option>
-                {peers.map((peer) => (
-                  <option key={peer.userId} value={peer.userId}>
-                    {peer.userName} (Private)
-                  </option>
-                ))}
-              </select>
+              <div className="relative user-dropdown-container">
+                {/* Selected user display / Search input */}
+                <div className="relative">
+                  <input
+                    type="text"
+                    value={showUserDropdown ? userSearchQuery : selectedUserName}
+                    onChange={(e) => {
+                      setUserSearchQuery(e.target.value);
+                      if (!showUserDropdown) setShowUserDropdown(true);
+                    }}
+                    onFocus={() => setShowUserDropdown(true)}
+                    placeholder="Search users or select Everyone..."
+                    className="w-full bg-gray-700 rounded px-3 py-2 pr-8 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                  <button
+                    onClick={() => setShowUserDropdown(!showUserDropdown)}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-white"
+                    aria-label="Toggle dropdown"
+                  >
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                    </svg>
+                  </button>
+                </div>
+
+                {/* Dropdown menu */}
+                {showUserDropdown && (
+                  <div className="absolute top-full left-0 right-0 mt-1 bg-gray-700 rounded shadow-lg max-h-60 overflow-y-auto z-10 border border-gray-600">
+                    {/* Everyone option */}
+                    <button
+                      onClick={() => {
+                        setSelectedChatUser('everyone');
+                        setUserSearchQuery('');
+                        setShowUserDropdown(false);
+                      }}
+                      className={`w-full text-left px-3 py-2 text-sm hover:bg-gray-600 transition-colors ${
+                        selectedChatUser === 'everyone' ? 'bg-blue-600' : ''
+                      }`}
+                    >
+                      <span className="flex items-center gap-2">
+                        <span>👥</span>
+                        <span>Everyone</span>
+                      </span>
+                    </button>
+
+                    {/* Filtered users */}
+                    {filteredUsers.length > 0 ? (
+                      filteredUsers.map((peer) => (
+                        <button
+                          key={peer.userId}
+                          onClick={() => {
+                            setSelectedChatUser(peer.userId);
+                            setUserSearchQuery('');
+                            setShowUserDropdown(false);
+                          }}
+                          className={`w-full text-left px-3 py-2 text-sm hover:bg-gray-600 transition-colors ${
+                            selectedChatUser === peer.userId ? 'bg-blue-600' : ''
+                          }`}
+                        >
+                          <span className="flex items-center gap-2">
+                            <span>🔒</span>
+                            <span>{peer.userName}</span>
+                            <span className="text-xs text-gray-400">(Private)</span>
+                          </span>
+                        </button>
+                      ))
+                    ) : (
+                      <div className="px-3 py-2 text-sm text-gray-400 text-center">
+                        No users found
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
             </div>
             <div className="flex-1 overflow-y-auto p-3 md:p-4 space-y-2">
               {filteredMessages.length === 0 ? (
@@ -1465,7 +1657,8 @@ function LocalScreenShare({
   const videoRef = useRef<HTMLVideoElement>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const playAttemptedRef = useRef(false);
+  const currentStreamIdRef = useRef<string | null>(null);
+  const playPromiseRef = useRef<Promise<void> | null>(null);
 
   useEffect(() => {
     if (!stream || !videoRef.current) {
@@ -1474,41 +1667,58 @@ function LocalScreenShare({
     }
 
     const videoElement = videoRef.current;
-    console.log('LocalScreenShare: Setting up stream', stream.id);
+    const streamId = stream.id;
+    
+    // Prevent play interruption by checking if this exact stream is already set
+    if (currentStreamIdRef.current === streamId) {
+      return;
+    }
+    
+    console.log('LocalScreenShare: Setting up stream', streamId);
 
-    // Set the stream
-    videoElement.srcObject = stream;
-    playAttemptedRef.current = false;
-
-    // Handle loaded metadata
-    const handleLoadedMetadata = () => {
-      if (playAttemptedRef.current) return;
-      playAttemptedRef.current = true;
-      
-      console.log('LocalScreenShare: Metadata loaded, attempting play');
-      videoElement.play()
-        .then(() => {
-          console.log('LocalScreenShare: Playing successfully');
-          setIsPlaying(true);
-          setError(null);
-        })
-        .catch((err) => {
+    // Handle stream update asynchronously
+    const updateStream = async () => {
+      try {
+        // Wait for any pending play promise
+        if (playPromiseRef.current) {
+          await playPromiseRef.current.catch(() => {});
+        }
+        
+        // Pause and update stream
+        videoElement.pause();
+        videoElement.srcObject = stream;
+        currentStreamIdRef.current = streamId;
+        
+        // Wait for metadata
+        await new Promise<void>((resolve) => {
+          if (videoElement.readyState >= 1) {
+            resolve();
+          } else {
+            videoElement.addEventListener('loadedmetadata', () => resolve(), { once: true });
+          }
+        });
+        
+        console.log('LocalScreenShare: Metadata loaded, attempting play');
+        
+        // Play the video
+        playPromiseRef.current = videoElement.play();
+        await playPromiseRef.current;
+        playPromiseRef.current = null;
+        
+        console.log('LocalScreenShare: Playing successfully');
+        setIsPlaying(true);
+        setError(null);
+      } catch (err) {
+        playPromiseRef.current = null;
+        // Silently ignore AbortError and NotAllowedError
+        if (err instanceof Error && err.name !== 'AbortError' && err.name !== 'NotAllowedError') {
           console.error('LocalScreenShare: Play error:', err);
           setError('Failed to play screen share');
-          // Retry after a short delay
-          setTimeout(() => {
-            videoElement.play()
-              .then(() => {
-                console.log('LocalScreenShare: Retry successful');
-                setIsPlaying(true);
-                setError(null);
-              })
-              .catch((retryErr) => {
-                console.error('LocalScreenShare: Retry failed:', retryErr);
-              });
-          }, 500);
-        });
+        }
+      }
     };
+
+    updateStream();
 
     // Handle play event
     const handlePlay = () => {
@@ -1529,23 +1739,25 @@ function LocalScreenShare({
       setError('Video playback error');
     };
 
-    videoElement.addEventListener('loadedmetadata', handleLoadedMetadata);
     videoElement.addEventListener('play', handlePlay);
     videoElement.addEventListener('pause', handlePause);
     videoElement.addEventListener('error', handleError);
 
-    // If metadata is already loaded, play immediately
-    if (videoElement.readyState >= 1) {
-      handleLoadedMetadata();
-    }
-
+    // Cleanup
     return () => {
-      videoElement.removeEventListener('loadedmetadata', handleLoadedMetadata);
       videoElement.removeEventListener('play', handlePlay);
       videoElement.removeEventListener('pause', handlePause);
       videoElement.removeEventListener('error', handleError);
     };
   }, [stream]);
+
+  // Reset stream tracking when component unmounts
+  useEffect(() => {
+    return () => {
+      currentStreamIdRef.current = null;
+      playPromiseRef.current = null;
+    };
+  }, []);
 
   return (
     <>
@@ -1630,6 +1842,8 @@ function VideoCardStrip({
   const videoRef = useRef<HTMLVideoElement>(null);
   const [hasVideo, setHasVideo] = useState(true);
   const [peerStream, setPeerStream] = useState<MediaStream | null>(null);
+  const currentStreamIdRef = useRef<string | null>(null);
+  const playPromiseRef = useRef<Promise<void> | null>(null);
 
   // Derive the active stream from props or peer stream
   const activeStream = stream || peerStream;
@@ -1653,12 +1867,51 @@ function VideoCardStrip({
   useEffect(() => {
     if (!activeStream || !videoRef.current) return;
 
-    console.log(`Setting video srcObject for ${userName}:`, activeStream.id);
     const videoElement = videoRef.current;
-    videoElement.srcObject = activeStream;
-    videoElement.play().catch((err) => {
-      console.error(`Error playing video for ${userName}:`, err);
-    });
+    const streamId = activeStream.id;
+    
+    // Prevent play interruption by checking if this exact stream is already set
+    if (currentStreamIdRef.current === streamId) {
+      return;
+    }
+
+    console.log(`Setting video srcObject for ${userName}:`, streamId);
+    
+    // Wait for any pending play promise to resolve before changing stream
+    const updateStream = async () => {
+      try {
+        if (playPromiseRef.current) {
+          await playPromiseRef.current.catch(() => {});
+        }
+        
+        // Pause and clear current stream
+        videoElement.pause();
+        videoElement.srcObject = activeStream;
+        currentStreamIdRef.current = streamId;
+        
+        // Wait for metadata to load
+        await new Promise<void>((resolve) => {
+          if (videoElement.readyState >= 1) {
+            resolve();
+          } else {
+            videoElement.addEventListener('loadedmetadata', () => resolve(), { once: true });
+          }
+        });
+        
+        // Play the video
+        playPromiseRef.current = videoElement.play();
+        await playPromiseRef.current;
+        playPromiseRef.current = null;
+      } catch (err) {
+        playPromiseRef.current = null;
+        // Silently ignore AbortError and NotAllowedError
+        if (err instanceof Error && err.name !== 'AbortError' && err.name !== 'NotAllowedError') {
+          console.error(`Error playing video for ${userName}:`, err);
+        }
+      }
+    };
+    
+    updateStream();
     
     const videoTrack = activeStream.getVideoTracks()[0];
     if (!videoTrack) return;

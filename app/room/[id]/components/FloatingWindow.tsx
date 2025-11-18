@@ -1,36 +1,59 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
+
+interface Participant {
+  id: string;
+  stream: MediaStream;
+  userName: string;
+  isScreenShare: boolean;
+}
 
 interface FloatingWindowProps {
-  stream: MediaStream | null;
-  userName: string;
+  participants: Participant[];
   isVisible: boolean;
   onClose?: () => void;
 }
 
-export function FloatingWindow({ stream, userName, isVisible, onClose }: FloatingWindowProps) {
+export function FloatingWindow({ participants, isVisible, onClose }: FloatingWindowProps) {
   const popupWindowRef = useRef<Window | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
   const checkIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const participantsRef = useRef<Participant[]>([]);
+  const isPopupOpenRef = useRef(false);
+  const [isMobile] = useState(() => {
+    if (typeof window === 'undefined') return false;
+    return /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+  });
 
+  // Effect to open/close popup based on visibility (Desktop only)
   useEffect(() => {
-    // Only proceed if visible and we have a stream
-    if (!isVisible || !stream || typeof window === 'undefined') {
+    if (isMobile) return; // Skip popup for mobile
+
+    if (!isVisible || typeof window === 'undefined') {
+      // Close popup if it's open and visibility is false
+      if (isPopupOpenRef.current && popupWindowRef.current && !popupWindowRef.current.closed) {
+        console.log('FloatingWindow: Closing popup (not visible)');
+        cleanup();
+      }
       return;
     }
 
-    // Store stream reference
-    streamRef.current = stream;
+    // If no participants yet, wait
+    if (!participants || participants.length === 0) {
+      console.log('FloatingWindow: Waiting for participants...');
+      return;
+    }
 
     // Check if popup is already open
-    if (popupWindowRef.current && !popupWindowRef.current.closed) {
-      // Update existing popup with new stream
-      updatePopupStream(popupWindowRef.current, stream, userName);
+    if (isPopupOpenRef.current && popupWindowRef.current && !popupWindowRef.current.closed) {
+      // Popup is already open, don't recreate
       return;
     }
 
     // Open new popup window
-    const width = 320;
-    const height = 280;
+    console.log('FloatingWindow: Opening new popup with', participants.length, 'participants');
+    isPopupOpenRef.current = true;
+
+    const width = 380;
+    const height = 320;
     const left = window.screen.width - width - 20;
     const top = 80;
 
@@ -41,35 +64,52 @@ export function FloatingWindow({ stream, userName, isVisible, onClose }: Floatin
     );
 
     if (!popup) {
-      console.error('Failed to open popup window. Please allow popups for this site.');
-      onClose?.();
+      console.warn('Failed to open popup window. Please allow popups for this site.');
+      isPopupOpenRef.current = false;
+      if (typeof window !== 'undefined') {
+        setTimeout(() => {
+          alert('Please allow popups for this site to use the floating window feature.\n\nYou can enable popups in your browser settings.');
+        }, 100);
+      }
       return;
     }
 
     popupWindowRef.current = popup;
 
-    // Set up the popup window content
-    setupPopupWindow(popup, stream, userName, onClose);
+    // Set up the popup window content with tabs
+    setupPopupWindow(popup, participants, onClose);
 
     // Monitor if popup is closed by user
     checkIntervalRef.current = setInterval(() => {
       if (popup.closed) {
+        console.log('FloatingWindow: Popup was closed by user');
+        isPopupOpenRef.current = false;
         cleanup();
         onClose?.();
       }
     }, 500);
-
-    return () => {
-      cleanup();
-    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isVisible, stream, userName]);
+  }, [isVisible]);
 
-  // Only cleanup when component unmounts (not when isVisible changes)
-  // This allows the popup to stay open even when returning to the main tab
+  // Separate effect to update participants when they change
+  useEffect(() => {
+    if (!isPopupOpenRef.current || !popupWindowRef.current || popupWindowRef.current.closed) {
+      return;
+    }
+
+    if (!participants || participants.length === 0) {
+      return;
+    }
+
+    // Update existing popup with new participants
+    console.log('FloatingWindow: Updating participants in existing popup');
+    participantsRef.current = participants;
+    updatePopupParticipants(popupWindowRef.current, participants);
+  }, [participants]);
+
+  // Only cleanup when component unmounts
   useEffect(() => {
     return () => {
-      // Cleanup only on unmount
       if (checkIntervalRef.current) {
         clearInterval(checkIntervalRef.current);
         checkIntervalRef.current = null;
@@ -82,6 +122,7 @@ export function FloatingWindow({ stream, userName, isVisible, onClose }: Floatin
   }, []);
 
   const cleanup = () => {
+    isPopupOpenRef.current = false;
     if (checkIntervalRef.current) {
       clearInterval(checkIntervalRef.current);
       checkIntervalRef.current = null;
@@ -94,8 +135,7 @@ export function FloatingWindow({ stream, userName, isVisible, onClose }: Floatin
 
   const setupPopupWindow = (
     popup: Window,
-    stream: MediaStream,
-    userName: string,
+    participants: Participant[],
     onClose?: () => void
   ) => {
     const doc = popup.document;
@@ -106,7 +146,7 @@ export function FloatingWindow({ stream, userName, isVisible, onClose }: Floatin
         <head>
           <meta charset="UTF-8">
           <meta name="viewport" content="width=device-width, initial-scale=1.0">
-          <title>Video - ${userName}</title>
+          <title>Meeting - ${participants[0]?.userName || 'Video'}</title>
           <style>
             * {
               margin: 0;
@@ -122,16 +162,13 @@ export function FloatingWindow({ stream, userName, isVisible, onClose }: Floatin
               height: 100vh;
             }
             .header {
-              background: linear-gradient(to bottom, rgba(0,0,0,0.8), transparent);
+              background: rgba(0,0,0,0.9);
               padding: 8px 12px;
               display: flex;
               justify-content: space-between;
               align-items: center;
-              position: absolute;
-              top: 0;
-              left: 0;
-              right: 0;
-              z-index: 10;
+              border-bottom: 1px solid rgba(255,255,255,0.1);
+              z-index: 20;
             }
             .title {
               color: white;
@@ -158,30 +195,56 @@ export function FloatingWindow({ stream, userName, isVisible, onClose }: Floatin
               background: rgba(239,68,68,0.8);
               transform: scale(1.1);
             }
+            .tabs {
+              background: rgba(0,0,0,0.8);
+              display: flex;
+              gap: 4px;
+              padding: 6px 8px;
+              overflow-x: auto;
+              border-bottom: 1px solid rgba(255,255,255,0.1);
+              scrollbar-width: thin;
+            }
+            .tabs::-webkit-scrollbar {
+              height: 4px;
+            }
+            .tabs::-webkit-scrollbar-thumb {
+              background: rgba(255,255,255,0.3);
+              border-radius: 2px;
+            }
+            .tab {
+              background: rgba(255,255,255,0.1);
+              border: none;
+              color: rgba(255,255,255,0.7);
+              padding: 6px 12px;
+              border-radius: 6px;
+              cursor: pointer;
+              font-size: 11px;
+              white-space: nowrap;
+              transition: all 0.2s;
+              display: flex;
+              align-items: center;
+              gap: 4px;
+            }
+            .tab:hover {
+              background: rgba(255,255,255,0.15);
+              color: white;
+            }
+            .tab.active {
+              background: rgba(59,130,246,0.8);
+              color: white;
+            }
             .video-container {
               flex: 1;
               display: flex;
               align-items: center;
               justify-content: center;
               background: #000;
+              position: relative;
             }
             video {
               width: 100%;
               height: 100%;
               object-fit: contain;
-            }
-            .footer {
-              background: linear-gradient(to top, rgba(0,0,0,0.8), transparent);
-              padding: 8px;
-              text-align: center;
-              position: absolute;
-              bottom: 0;
-              left: 0;
-              right: 0;
-            }
-            .footer-text {
-              color: rgba(255,255,255,0.7);
-              font-size: 10px;
             }
             .status {
               position: absolute;
@@ -205,13 +268,23 @@ export function FloatingWindow({ stream, userName, isVisible, onClose }: Floatin
               0% { transform: rotate(0deg); }
               100% { transform: rotate(360deg); }
             }
+            .footer {
+              background: rgba(0,0,0,0.8);
+              padding: 6px;
+              text-align: center;
+              border-top: 1px solid rgba(255,255,255,0.1);
+            }
+            .footer-text {
+              color: rgba(255,255,255,0.5);
+              font-size: 9px;
+            }
           </style>
         </head>
         <body>
           <div class="header">
             <div class="title">
-              <span>📹</span>
-              <span id="userName">${userName}</span>
+              <span id="icon">📹</span>
+              <span id="currentName">Meeting</span>
             </div>
             <button class="close-btn" onclick="window.close()" title="Close window">
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -219,18 +292,23 @@ export function FloatingWindow({ stream, userName, isVisible, onClose }: Floatin
               </svg>
             </button>
           </div>
+          <div class="tabs" id="tabs"></div>
           <div class="video-container">
             <div class="status" id="status">
               <div class="spinner"></div>
               <div>Connecting...</div>
             </div>
-            <video id="video" autoplay muted playsinline></video>
+            <video id="video" autoplay playsinline></video>
           </div>
           <div class="footer">
-            <div class="footer-text">Always on top • Drag to move</div>
+            <div class="footer-text">Always on top • Switch tabs to view different participants</div>
           </div>
           <script>
-            // Keep window always on top (best effort)
+            let participants = [];
+            let currentIndex = 0;
+            let videoStreams = new Map();
+
+            // Keep window always on top
             window.focus();
             setInterval(() => {
               if (!document.hidden) {
@@ -238,21 +316,98 @@ export function FloatingWindow({ stream, userName, isVisible, onClose }: Floatin
               }
             }, 1000);
 
-            // Handle video stream
-            const video = document.getElementById('video');
-            const status = document.getElementById('status');
-            
+            function switchToParticipant(index) {
+              if (index < 0 || index >= participants.length) {
+                console.log('Invalid index:', index);
+                return;
+              }
+              
+              currentIndex = index;
+              const participant = participants[index];
+              const video = document.getElementById('video');
+              const status = document.getElementById('status');
+              const icon = document.getElementById('icon');
+              const currentName = document.getElementById('currentName');
+              
+              console.log('Switching to participant:', participant.userName, participant.id);
+              
+              // Update UI
+              icon.textContent = participant.isScreenShare ? '🖥️' : '📹';
+              currentName.textContent = participant.userName;
+              document.title = (participant.isScreenShare ? 'Screen Share' : 'Video') + ' - ' + participant.userName;
+              
+              // Update tabs
+              document.querySelectorAll('.tab').forEach((tab, i) => {
+                tab.classList.toggle('active', i === index);
+              });
+              
+              // Get stream from window.videoStreams (set by parent)
+              const stream = window.videoStreams ? window.videoStreams.get(participant.id) : null;
+              
+              console.log('Stream found:', stream ? stream.id : 'none');
+              
+              if (stream && video) {
+                video.srcObject = stream;
+                video.muted = !participant.isScreenShare;
+                video.play().then(() => {
+                  console.log('Video playing successfully');
+                  status.style.display = 'none';
+                }).catch(err => {
+                  console.error('Error playing video:', err);
+                  // Retry after a short delay
+                  setTimeout(() => {
+                    video.play().then(() => {
+                      console.log('Video playing after retry');
+                      status.style.display = 'none';
+                    }).catch(e => console.error('Retry failed:', e));
+                  }, 500);
+                });
+              } else {
+                console.error('No stream available for participant:', participant.id);
+                status.style.display = 'flex';
+              }
+            }
+
+            function updateParticipants(newParticipants) {
+              console.log('Updating participants:', newParticipants.length);
+              participants = newParticipants;
+              const tabsContainer = document.getElementById('tabs');
+              tabsContainer.innerHTML = '';
+              
+              participants.forEach((p, index) => {
+                const tab = document.createElement('button');
+                tab.className = 'tab' + (index === currentIndex ? ' active' : '');
+                const displayName = p.userName.split(' - ')[0].substring(0, 15);
+                tab.innerHTML = (p.isScreenShare ? '🖥️' : '📹') + ' ' + displayName;
+                tab.onclick = () => switchToParticipant(index);
+                tabsContainer.appendChild(tab);
+              });
+              
+              // Switch to first participant if current index is invalid
+              if (currentIndex >= participants.length) {
+                currentIndex = 0;
+              }
+              
+              // Small delay to ensure streams are set
+              setTimeout(() => {
+                switchToParticipant(currentIndex);
+              }, 100);
+            }
+
+            // Handle messages from parent
             window.addEventListener('message', (event) => {
-              if (event.data.type === 'UPDATE_STREAM') {
-                // Stream will be set from parent
-                status.style.display = 'none';
-              } else if (event.data.type === 'UPDATE_NAME') {
-                document.getElementById('userName').textContent = event.data.userName;
-                document.title = 'Video - ' + event.data.userName;
+              if (event.data.type === 'UPDATE_PARTICIPANTS') {
+                updateParticipants(event.data.participants);
+              } else if (event.data.type === 'SET_STREAM') {
+                videoStreams.set(event.data.id, event.data.stream);
+                // If this is the current participant, update video
+                if (participants[currentIndex]?.id === event.data.id) {
+                  switchToParticipant(currentIndex);
+                }
               }
             });
 
-            // Notify parent when window is ready
+            // Notify parent when ready
             if (window.opener) {
               window.opener.postMessage({ type: 'POPUP_READY' }, '*');
             }
@@ -262,30 +417,45 @@ export function FloatingWindow({ stream, userName, isVisible, onClose }: Floatin
     `);
     doc.close();
 
-    // Wait for popup to be ready, then set the stream
+    // Wait for popup to be ready, then set participants and streams
     setTimeout(() => {
-      updatePopupStream(popup, stream, userName);
+      updatePopupParticipants(popup, participants);
     }, 100);
   };
 
-  const updatePopupStream = (popup: Window, stream: MediaStream, userName: string) => {
+  const updatePopupParticipants = (popup: Window, participants: Participant[]) => {
     try {
-      const video = popup.document.getElementById('video') as HTMLVideoElement;
-      const status = popup.document.getElementById('status') as HTMLElement;
-      
-      if (video && stream) {
-        video.srcObject = stream;
-        video.play().then(() => {
-          if (status) status.style.display = 'none';
-        }).catch((err) => {
-          console.error('Error playing video in popup:', err);
-        });
+      if (!popup || popup.closed) {
+        console.error('FloatingWindow: Popup is closed');
+        return;
       }
 
-      // Update name
-      popup.postMessage({ type: 'UPDATE_NAME', userName }, '*');
+      console.log('FloatingWindow: Updating popup with', participants.length, 'participants');
+
+      // Store streams directly in popup's window object
+      if (!(popup as any).videoStreams) {
+        (popup as any).videoStreams = new Map();
+      }
+      
+      participants.forEach(p => {
+        if (p.stream) {
+          console.log('FloatingWindow: Setting stream for', p.userName, p.stream.id);
+          (popup as any).videoStreams.set(p.id, p.stream);
+        }
+      });
+
+      // Send participant info (without streams)
+      const participantInfo = participants.map(p => ({
+        id: p.id,
+        userName: p.userName,
+        isScreenShare: p.isScreenShare
+      }));
+      
+      popup.postMessage({ type: 'UPDATE_PARTICIPANTS', participants: participantInfo }, '*');
+      
+      console.log('FloatingWindow: Participants updated successfully');
     } catch (err) {
-      console.error('Error updating popup stream:', err);
+      console.error('FloatingWindow: Error updating popup participants:', err);
     }
   };
 
